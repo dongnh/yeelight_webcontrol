@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yeelight-web-controller"
+version = "0.2.0"
+description = "Using WIFI communication to control Yeelight-based home lighting system via HTTP GET."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flask",
+    "yeelight"
+]
+
+[project.scripts]
+yeelight-srv = "server:main"
+
+[tool.isort]
+profile = "black"
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
