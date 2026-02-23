@@ -7,9 +7,17 @@ Using WIFI communication to control a Yeelight-based home lighting system via a 
 
 ## Installation
 Create a virtual environment, activate it, and install the `yeelight-web-controller` package using your preferred Python package manager.
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install casambi-web-controller
+```
 
 ## Execution
 Run the executable command provided by the package.
+```bash
+yeelight-srv -p 9800
+```
 *Note: You can pass `-p` or `--port` to specify a custom web service port (default is 9800).*
 
 ## API Endpoints
