@@ -10,7 +10,7 @@ Create a virtual environment, activate it, and install the `yeelight-web-control
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install casambi-web-controller
+pip install yeelight-web-controller
 ```
 
 ## Execution
