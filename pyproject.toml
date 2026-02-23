@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-yeelight-srv = "server:main"
+yeelight-srv = "cli.server:main"
 
 [tool.isort]
 profile = "black"
