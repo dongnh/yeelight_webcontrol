@@ -6,6 +6,8 @@ You can utilize this API to automate the modulation of the light's color tempera
 
 <img width="403" height="302" alt="image" src="https://github.com/user-attachments/assets/ac74e88a-3ee4-4698-a61b-ed57d4794242" />
 
+In the image, I utilize the Synology NAS scheduling feature to configure the lighting for two Yeelight Halo Pro units every minute.
+
 ## Requirements
 - Python 3.12 or higher.
 - Lighting devices must be registered to access the LAN and authorized for LAN Control within the Yeelight Classic application. Please refer to the product's accompanying manual for instructions on how to do this.
