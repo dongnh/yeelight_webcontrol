@@ -2,8 +2,12 @@
 
 Using WIFI communication to control a Yeelight-based home lighting system via a web interface, run on local machines PC/Mac.
 
-## Prerequisites
+You can utilize this API to automate the modulation of the light's color temperature and luminous intensity to simulate an artificial skylight.
+<img width="806" height="605" alt="image" src="https://github.com/user-attachments/assets/ac74e88a-3ee4-4698-a61b-ed57d4794242" />
+
+## Requirements
 - Python 3.12 or higher.
+- Lighting devices must be registered to access the LAN and authorized for LAN Control within the Yeelight Classic application. Please refer to the product's accompanying manual for instructions on how to do this.
 
 ## Installation
 Create a virtual environment, activate it, and install the `yeelight-web-controller` package using your preferred Python package manager.
