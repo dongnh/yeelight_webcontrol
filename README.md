@@ -3,6 +3,7 @@
 Using WIFI communication to control a Yeelight-based home lighting system via a web interface, run on local machines PC/Mac.
 
 You can utilize this API to automate the modulation of the light's color temperature and luminous intensity to simulate an artificial skylight.
+
 <img width="403" height="302" alt="image" src="https://github.com/user-attachments/assets/ac74e88a-3ee4-4698-a61b-ed57d4794242" />
 
 ## Requirements
