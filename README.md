@@ -41,6 +41,6 @@ yeelight-srv -p 9800
 - **Parameters:**
   - `id` (string): The specific hardware ID of the device.
   - `temp` (integer): The target color temperature in Kelvin.
-  - `brightness` (float): The target brightness level from 0 to 1 (0 triggers power off, values between 0 and 1 trigger Moonlight Mode if supported, and 1 triggers 100% Normal Mode).
+  - `brightness` (float): The target brightness level from 0 to 1 (0 triggers power off, values between 0 and 1 trigger Moonlight Mode if supported, and values between 1 and 100 trigger Normal Mode).
 - **Description:** Sequentially configures the color temperature and brightness level for the specified device with a 1-second linear transition.
 - **Example:** `http://localhost:9800/api/set?id=0x000000002ce4355f&temp=4800&brightness=1`
