@@ -1,5 +1,5 @@
 # Yeelight Web Controller
-A local web interface for managing Yeelight lighting systems over Wi-Fi, designed to integrate seamlessly with localized smart home infrastructures. This API facilitates the automated modulation of luminous intensity and color temperature (Nhiệt độ màu).
+A local web interface for managing Yeelight lighting systems over Wi-Fi, designed to integrate seamlessly with localized smart home infrastructures. This API facilitates the automated modulation of luminous intensity and color temperature.
 
 ## System Architecture
 The system isolates device communication from API delivery to ensure non-blocking operations:
@@ -13,7 +13,7 @@ The system isolates device communication from API delivery to ensure non-blockin
 ## Requirements
 * Python 3.12 or higher.
 
-* Lighting devices must have LAN Control (Điều khiển nội bộ) explicitly enabled via the Yeelight Classic application prior to integration.
+* Lighting devices must have **LAN Control** explicitly enabled via the **Yeelight Classic** application prior to integration.
 
 ## Installation
 * Create a virtual environment and install the package using your preferred Python package manager.
@@ -24,8 +24,8 @@ The system isolates device communication from API delivery to ensure non-blockin
     pip install yeelight-web-controller
   ```
 
-** Execution
-Start the service by executing the primary command. The server will initialize and begin caching device states.
+## Execution
+* Start the service by executing the primary command. The server will initialize and begin caching device states.
 
   ```bash
     yeelight-srv -p 9800
@@ -34,7 +34,7 @@ Start the service by executing the primary command. The server will initialize a
 Note: You can pass -p or --port to specify a custom web service port (default is 9800).
 
 ## API Endpoints (Điểm cuối API)
-1. Acquire device inventory (Truy xuất danh sách thiết bị)
+### Acquire device inventory
 
 * URL: `/api/lights`
 
@@ -68,7 +68,7 @@ Note: You can pass -p or --port to specify a custom web service port (default is
   }
   ```
 
-2. Configure light state
+### Configure light state
 
 * URL: `/api/set`
 
@@ -78,17 +78,17 @@ Note: You can pass -p or --port to specify a custom web service port (default is
 
 * Parameters:
 
-- `id` (string, required): The specific hardware ID of the device.
-
-- `brightness` (float, required): The target luminance parameter.
-
-  - Value <= 0.0: Triggers device power off.
-
-  - Value > 0.0 and < 1.0: Triggers Moonlight Mode if supported by the hardware model.
-
-  - Value >= 1.0: Triggers Normal Mode.
-
-- `temp` (integer, optional): The target color temperature in Kelvin. Applicable primarily in Normal Mode.
+  - `id` (string, required): The specific hardware ID of the device.
+  
+  - `brightness` (float, required): The target luminance parameter.
+  
+    - Value <= 0.0: Triggers device power off.
+  
+    - Value > 0.0 and < 1.0: Triggers Moonlight Mode if supported by the hardware model.
+  
+    - Value >= 1.0: Triggers Normal Mode.
+  
+  - `temp` (integer, optional): The target color temperature in Kelvin. Applicable primarily in Normal Mode.
 
 * Example: ```http://localhost:9800/api/set?id=0x000000002ce4355f&brightness=0.8&temp=4800```
 
@@ -100,7 +100,7 @@ Note: You can pass -p or --port to specify a custom web service port (default is
   }
   ```
 
-Note: In the event of an invalid parameter or unlocated device, the system will return an HTTP 400 or 404 status code alongside an error payload, such as:
+* Note: In the event of an invalid parameter or unlocated device, the system will return an HTTP 400 or 404 status code alongside an error payload, such as:
 
   ```json
   {
