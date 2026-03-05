@@ -33,7 +33,7 @@ The system isolates device communication from API delivery to ensure non-blockin
 
 Note: You can pass -p or --port to specify a custom web service port (default is 9800).
 
-## API Endpoints (Điểm cuối API)
+## API Endpoints
 ### Acquire device inventory
 
 * URL: `/api/lights`
