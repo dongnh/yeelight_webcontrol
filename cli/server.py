@@ -3,85 +3,92 @@ import json
 import logging
 import socket
 import argparse
-from flask import Flask, jsonify, request
+import uvicorn
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 from yeelight import discover_bulbs, Bulb, PowerMode
 
-app = Flask(__name__)
+app = FastAPI()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
-CACHE_FILE = 'cache.txt'
+CACHE_FILE = 'cache.json'
+NAMES_FILE = 'names.json'
 
-def load_cache():
-    if os.path.exists(CACHE_FILE):
+def load_json(file_path: str) -> dict:
+    # Load JSON file safely
+    if os.path.exists(file_path):
         try:
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
-            logging.error(f"Cache read error: {e}")
+            logging.error(f"Read error {file_path}: {e}")
     return {}
 
-def save_cache(data):
+def save_json(file_path: str, data: dict):
+    # Save JSON file safely
     try:
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+        with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        logging.error(f"Cache write error: {e}")
+        logging.error(f"Write error {file_path}: {e}")
 
-@app.route('/api/lights', methods=['GET'])
+class DeviceNameRequest(BaseModel):
+    bulb_id: str
+    name: str
+
+@app.get('/api/lights')
 def get_lights():
-    try:
-        known_devices = load_cache()
-        discovered = discover_bulbs(timeout=2)
-        discovered_ips = {b.get('ip'): b for b in discovered if b.get('ip')}
-        
-        all_ips = set(known_devices.keys()).union(set(discovered_ips.keys()))
-        active_devices = {}
-        socket.setdefaulttimeout(3)
-        
-        for ip in all_ips:
-            try:
-                device = Bulb(ip)
-                props = device.get_properties(['bright', 'ct'])
-                
-                if props:
-                    capabilities = discovered_ips.get(ip, {}).get('capabilities', {})
-                    bulb_id = capabilities.get('id') or known_devices.get(ip, {}).get('id', 'Unknown')
-                    raw_model = capabilities.get('model') or known_devices.get(ip, {}).get('model', 'Unknown')
-                    
-                    active_devices[ip] = {
-                        "ip": ip,
-                        "id": bulb_id,
-                        "model": raw_model,
-                        "temperature_k": int(props.get('ct', 0)) if props.get('ct') else 0,
-                        "brightness_pct": int(props.get('bright', 0)) if props.get('bright') else 0
-                    }
-            except Exception:
-                pass
-                
-        socket.setdefaulttimeout(10)
-        if known_devices != active_devices:
-            save_cache(active_devices)
+    # Discover devices and append custom names
+    known_devices = load_json(CACHE_FILE)
+    custom_names = load_json(NAMES_FILE)
+    discovered = discover_bulbs(timeout=2)
+    discovered_ips = {b.get('ip'): b for b in discovered if b.get('ip')}
+    
+    all_ips = set(known_devices.keys()).union(set(discovered_ips.keys()))
+    active_devices = {}
+    socket.setdefaulttimeout(3)
+    
+    for ip in all_ips:
+        try:
+            device = Bulb(ip)
+            props = device.get_properties(['bright', 'ct'])
             
-        return jsonify({"status": "success", "data": list(active_devices.values())}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+            if props:
+                capabilities = discovered_ips.get(ip, {}).get('capabilities', {})
+                bulb_id = capabilities.get('id') or known_devices.get(ip, {}).get('id', 'Unknown')
+                raw_model = capabilities.get('model') or known_devices.get(ip, {}).get('model', 'Unknown')
+                
+                active_devices[ip] = {
+                    "ip": ip,
+                    "id": bulb_id,
+                    "model": raw_model,
+                    "name": custom_names.get(bulb_id, "Unknown"),
+                    "temperature_k": int(props.get('ct', 0)) if props.get('ct') else 0,
+                    "brightness_pct": int(props.get('bright', 0)) if props.get('bright') else 0
+                }
+        except Exception:
+            pass
+            
+    socket.setdefaulttimeout(10)
+    if known_devices != active_devices:
+        save_json(CACHE_FILE, active_devices)
+        
+    return {"status": "success", "data": list(active_devices.values())}
 
-@app.route('/api/set', methods=['GET'])
-def set_light():
+@app.get('/api/set')
+def set_light(
+    bulb_id: str = Query(..., alias="id"),
+    temp: int = Query(None),
+    brightness: float = Query(...)
+):
+    # Adjust lighting parameters
+    known_devices = load_json(CACHE_FILE)
+    target_ip = next((ip for ip, info in known_devices.items() if info.get('id') == bulb_id), None)
+
+    if not target_ip:
+        raise HTTPException(status_code=404, detail="Device not found")
+
     try:
-        bulb_id = request.args.get('id')
-        temp = request.args.get('temp', type=int)
-        brightness = request.args.get('brightness', type=float)
-
-        if not bulb_id or brightness is None:
-            return jsonify({"status": "error", "message": "Missing parameters"}), 400
-
-        known_devices = load_cache()
-        target_ip = next((ip for ip, info in known_devices.items() if info.get('id') == bulb_id), None)
-
-        if not target_ip:
-            return jsonify({"status": "error", "message": "Device not found"}), 404
-
         device = Bulb(target_ip)
 
         if brightness <= 0:
@@ -105,10 +112,17 @@ def set_light():
                 device.set_color_temp(temp, duration=1000)
             device.set_brightness(int(brightness), duration=1000)
 
-        return jsonify({"status": "success", "message": "Operation successful"}), 200
-
+        return {"status": "success", "message": "Operation successful"}
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/api/name')
+def set_device_name(request: DeviceNameRequest):
+    # Store user defined device names
+    names = load_json(NAMES_FILE)
+    names[request.bulb_id] = request.name
+    save_json(NAMES_FILE, names)
+    return {"status": "success", "message": "Device name updated successfully"}
 
 def main():
     parser = argparse.ArgumentParser(description="Yeelight Local Control API")
@@ -116,7 +130,7 @@ def main():
     args = parser.parse_args()
     
     logging.info(f"Starting service on port {args.port}")
-    app.run(host='0.0.0.0', port=args.port)
+    uvicorn.run(app, host='0.0.0.0', port=args.port)
 
 if __name__ == '__main__':
     main()

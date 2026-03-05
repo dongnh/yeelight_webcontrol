@@ -108,3 +108,34 @@ Note: You can pass -p or --port to specify a custom web service port (default is
     "message": "Device not found"
   }
   ```
+
+  ### Assign device alias
+  
+* URL: `/api/name`
+
+* Method: POST
+
+* Description: Assigns or updates a persistent, human-readable identifier for a specific hardware ID. This nomenclature is committed to the local `names.json` cache.
+
+* Payload Schema:
+  ```json
+  {
+    "bulb_id": "0x000000002ce4355f",
+    "name": "Desk Lamp"
+  }
+  ```
+
+* Example Request
+  ```bash
+  curl -X POST http://localhost:9800/api/name \
+  -H "Content-Type: application/json" \
+  -d '{"bulb_id": "0x000000002ce4355f", "name": "Desk Lamp"}'
+  ```
+
+* Response Structure
+  ```json
+  {
+    "status": "success",
+    "message": "Device name updated successfully"
+  }
+  ```
