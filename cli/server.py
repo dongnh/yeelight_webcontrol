@@ -3,8 +3,9 @@ import json
 import logging
 import socket
 import argparse
+import urllib.parse
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 from yeelight import discover_bulbs, Bulb, PowerMode
 
@@ -116,6 +117,106 @@ def set_light(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get('/api/level')
+def get_or_set_level(
+    bulb_id: str = Query(..., alias="id"),
+    level: int = Query(None)
+):
+    # Locate device IP address via cached data
+    known_devices = load_json(CACHE_FILE)
+    target_ip = next((ip for ip, info in known_devices.items() if info.get('id') == bulb_id), None)
+    
+    if not target_ip:
+        raise HTTPException(status_code=404, detail="Device not found")
+        
+    device = Bulb(target_ip)
+    
+    if level is None:
+        # Retrieve current brightness and map to Matter logical range (0-254)
+        try:
+            props = device.get_properties(['bright'])
+            current_bright = int(props.get('bright', 0)) if props and props.get('bright') else 0
+            matter_level = int((current_bright / 100.0) * 254)
+            return {"id": bulb_id, "level": matter_level}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+            
+    # Map Matter logical range back to hardware brightness percentage (0-100)
+    try:
+        if level <= 0:
+            device.turn_off()
+        else:
+            device.turn_on()
+            hardware_bright = int((level / 254.0) * 100)
+            device.set_brightness(max(1, hardware_bright), duration=1000)
+        return {"status": "success", "level": level}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/api/kelvin')
+def get_or_set_kelvin(
+    bulb_id: str = Query(..., alias="id"),
+    kelvin: int = Query(None)
+):
+    # Locate device IP address via cached data
+    known_devices = load_json(CACHE_FILE)
+    target_ip = next((ip for ip, info in known_devices.items() if info.get('id') == bulb_id), None)
+    
+    if not target_ip:
+        raise HTTPException(status_code=404, detail="Device not found")
+        
+    device = Bulb(target_ip)
+    
+    if kelvin is None:
+        # Retrieve current color temperature directly from hardware
+        try:
+            props = device.get_properties(['ct'])
+            current_kelvin = int(props.get('ct', 0)) if props and props.get('ct') else 0
+            return {"id": bulb_id, "kelvin": current_kelvin}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+            
+    # Configure new color temperature
+    try:
+        device.turn_on()
+        device.set_color_temp(kelvin, duration=1000)
+        return {"status": "success", "kelvin": kelvin}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/api/mired')
+def get_or_set_mired(
+    bulb_id: str = Query(..., alias="id"),
+    mired: int = Query(None)
+):
+    # Locate device IP address via cached data
+    known_devices = load_json(CACHE_FILE)
+    target_ip = next((ip for ip, info in known_devices.items() if info.get('id') == bulb_id), None)
+    
+    if not target_ip:
+        raise HTTPException(status_code=404, detail="Device not found")
+        
+    device = Bulb(target_ip)
+    
+    if mired is None:
+        # Retrieve current Kelvin and convert to Mired
+        try:
+            props = device.get_properties(['ct'])
+            current_kelvin = int(props.get('ct', 0)) if props and props.get('ct') else 0
+            current_mired = int(1000000 / current_kelvin) if current_kelvin > 0 else 0
+            return {"id": bulb_id, "mired": current_mired}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+            
+    # Convert Mired input to Kelvin for hardware configuration
+    try:
+        kelvin = int(1000000 / mired) if mired > 0 else 4000
+        device.turn_on()
+        device.set_color_temp(kelvin, duration=1000)
+        return {"status": "success", "mired": mired}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post('/api/name')
 def set_device_name(request: DeviceNameRequest):
     # Store user defined device names
@@ -123,6 +224,72 @@ def set_device_name(request: DeviceNameRequest):
     names[request.bulb_id] = request.name
     save_json(NAMES_FILE, names)
     return {"status": "success", "message": "Device name updated successfully"}
+
+@app.get('/api/metadata')
+def get_bridge_metadata(request: Request):
+    # Dynamically detect host and port from the incoming HTTP request
+    host = request.url.hostname
+    port = request.url.port or 9800
+    
+    known_devices = load_json(CACHE_FILE)
+    custom_names = load_json(NAMES_FILE)
+    
+    devices_metadata = []
+    
+    # Iterate over available units in the local network
+    for ip, info in known_devices.items():
+        bulb_id = info.get('id')
+        if not bulb_id:
+            continue
+            
+        name = custom_names.get(bulb_id, "Unknown")
+        safe_id = urllib.parse.quote(bulb_id)
+        node_identifier = bulb_id.replace(" ", "_").lower()
+        
+        device_config = {
+            "node_id": f"yeelight_{node_identifier}",
+            "name": name,
+            "hardware_type": "color_temperature_light",
+            "events": {
+                "turn_on": {
+                    "trigger": "on_off_cluster",
+                    "script": f"import urllib.request\n# Execute GET request to set level to maximum (254)\nurllib.request.urlopen('http://{host}:{port}/api/level?id={safe_id}&level=254')"
+                },
+                "turn_off": {
+                    "trigger": "on_off_cluster",
+                    "script": f"import urllib.request\n# Execute GET request to turn off (0)\nurllib.request.urlopen('http://{host}:{port}/api/level?id={safe_id}&level=0')"
+                },
+                "set_level": {
+                    "trigger": "level_control_cluster",
+                    "script": f"import sys, urllib.request\n# Send integer level (0-254) directly to the API\nmatter_level = int(sys.argv[1]) if len(sys.argv) > 1 else 254\nurllib.request.urlopen(f'http://{host}:{port}/api/level?id={safe_id}&level={{matter_level}}')"
+                },
+                "read_level": {
+                    "trigger": "level_control_cluster",
+                    "script": f"import urllib.request, json\n# Retrieve integer level directly from the API\nres = urllib.request.urlopen('http://{host}:{port}/api/level?id={safe_id}')\ndata = json.loads(res.read().decode('utf-8'))\nprint(data.get('level', 0))"
+                },
+                "set_color_temperature": {
+                    "trigger": "color_control_cluster",
+                    "script": f"import sys, urllib.request\n# Set color temperature using Mired\nmired = int(sys.argv[1]) if len(sys.argv) > 1 else 250\nurllib.request.urlopen(f'http://{host}:{port}/api/mired?id={safe_id}&mired={{mired}}')"
+                },
+                "read_color_temperature": {
+                    "trigger": "color_control_cluster",
+                    "script": f"import urllib.request, json\n# Retrieve current color temperature in Mired\nres = urllib.request.urlopen('http://{host}:{port}/api/mired?id={safe_id}')\ndata = json.loads(res.read().decode('utf-8'))\nprint(data.get('mired', 0))"
+                }
+            }
+        }
+        devices_metadata.append(device_config)
+        
+    bridge_metadata = {
+        "bridge": {
+            "id": "yeelight_bridge_http",
+            "type": "color_lighting_controller",
+            "network_host": host,
+            "network_port": port
+        },
+        "devices": devices_metadata
+    }
+    
+    return bridge_metadata
 
 def main():
     parser = argparse.ArgumentParser(description="Yeelight Local Control API")

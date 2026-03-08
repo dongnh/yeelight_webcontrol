@@ -8,7 +8,10 @@ The system isolates device communication from API delivery to ensure non-blockin
 
 * State Caching: The server maintains a persistent local JSON cache. This state-retention mechanism ensures seamless API responses and device tracking, even during intermittent network disconnections.
 
-* HTTP Setup: A Flask-based middleware that translates standard HTTP GET requests into native Yeelight LAN control commands.
+* HTTP Setup: A FastAPI-based middleware that translates standard HTTP GET requests into native Yeelight LAN control commands.
+
+## Limitations
+Currently, this web controller exclusively supports Yeelight hardware models equipped with both variable luminance (dimming) and adjustable color temperature capabilities.
 
 ## Requirements
 * Python 3.12 or higher.
@@ -109,7 +112,7 @@ Note: You can pass -p or --port to specify a custom web service port (default is
   }
   ```
 
-  ### Assign device alias
+### Assign device alias
   
 * URL: `/api/name`
 
@@ -139,3 +142,53 @@ Note: You can pass -p or --port to specify a custom web service port (default is
     "message": "Device name updated successfully"
   }
   ```
+
+### Matter Logical Level Control
+
+* URL: `/api/level`
+
+* Method: GET
+
+* Description: Retrieves or modifies the brightness level mapping to the Matter-compatible logical range (0-254).
+
+* Parameters:
+
+  - `id` (string, required): The specific hardware ID of the device.
+
+  - `level` (integer, optional): The target logical brightness level (0-254). If omitted, returns the current device level.
+
+### Color Temperature Control (Kelvin)
+
+* URL: /api/kelvin
+
+* Method: GET
+
+* Description: Retrieves or modifies the exact color temperature in Kelvin.
+
+* Parameters:
+
+  - `id` (string, required): The specific hardware ID of the device.
+
+  - `kelvin` (integer, optional): The target color temperature in Kelvin. If omitted, returns the current Kelvin value.
+
+### Color Temperature Control (Mired)
+
+* URL: `/api/mired`
+
+* Method: GET
+
+* Description: Retrieves or modifies the color temperature using the Matter-compatible Mired (Micro Reciprocal Degree) range.
+
+* Parameters:
+
+  - `id` (string, required): The specific hardware ID of the device.
+
+  - `mired` (integer, optional): The target color temperature in Mired. If omitted, returns the current Mired value.
+
+### Retrieve Bridge Metadata
+
+* URL: `/api/metadata`
+
+* Method: GET
+
+* Description: Retrieves dynamic bridge configuration and device metadata required for Matter ecosystem integration.
