@@ -4,18 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yeelight-web-controller"
-version = "0.4.0"
-description = "Using WIFI communication to control Yeelight-based home lighting system via HTTP GET."
+version = "0.5.0"
+description = "Yeelight LAN control bridge — REST API compatible with matter_webcontrol federation."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi",
     "uvicorn",
-    "yeelight"    
+    "yeelight",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "httpx",
 ]
 
 [project.scripts]
 yeelight-srv = "cli.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.isort]
 profile = "black"
