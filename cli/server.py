@@ -228,6 +228,11 @@ def seed_ips(ips: list[str]) -> dict[str, dict]:
             logging.warning(f"Seed: {ip} unreachable on port 55443")
             continue
         existing = cache.get(ip, {})
+        # Keep an already-known id (a hardware id, once SSDP has identified the
+        # bulb), otherwise assign the provisional `yeelight_<ip>` placeholder.
+        # That placeholder is transient: the next refresh that sees the bulb
+        # over SSDP replaces it with the bulb's permanent hardware id. Address
+        # bulbs by the hardware id, not by this seeded value.
         bulb_id = existing.get("id") or f"yeelight_{ip}"
         model = existing.get("model") or "unknown"
         cache[ip] = _build_device_entry(ip, bulb_id, model, props, names.get(bulb_id, []))
@@ -266,6 +271,12 @@ def _refresh_devices(timeout: int = 2, allow_probe: bool = True) -> dict[str, di
         if not props:
             continue
         caps = by_ip.get(ip, {}).get("capabilities") or {}
+        # Canonical identity, in priority order:
+        #   1. SSDP capabilities.id — the bulb's permanent hardware id (hex).
+        #   2. The id already in the cache (a hardware id once SSDP has seen it).
+        #   3. `yeelight_<ip>` — provisional fallback before SSDP ever identifies
+        #      the bulb. As soon as (1) is available it wins and is persisted, so
+        #      a seeded `yeelight_<ip>` upgrades to the hardware id permanently.
         bulb_id = caps.get("id") or known.get(ip, {}).get("id") or f"yeelight_{ip}"
         model = caps.get("model") or known.get(ip, {}).get("model") or "unknown"
         active[ip] = _build_device_entry(ip, bulb_id, model, props, names.get(bulb_id, []))
@@ -277,6 +288,11 @@ def _refresh_devices(timeout: int = 2, allow_probe: bool = True) -> dict[str, di
 
 
 def _find_by_id(device_id: str, cache: Optional[dict] = None) -> Optional[dict]:
+    """Resolve a device by its canonical `id` (the bulb's hardware id).
+
+    Matches the canonical id only. Aliases registered via `/api/name` live in
+    `names[]` for display and are deliberately not resolvable as ids.
+    """
     cache = cache if cache is not None else load_json(CACHE_FILE)
     for entry in cache.values():
         if entry.get("id") == device_id:
