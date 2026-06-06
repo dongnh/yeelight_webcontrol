@@ -19,7 +19,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from yeelight import Bulb, PowerMode, discover_bulbs
+from yeelight import Bulb, Flow, LightType, PowerMode, discover_bulbs
+try:
+    from yeelight.transitions import TemperatureTransition, SleepTransition
+except ImportError:  # older layouts expose them from yeelight.flow
+    from yeelight.flow import TemperatureTransition, SleepTransition
 
 CACHE_FILE = "cache.json"
 NAMES_FILE = "names.json"
@@ -339,6 +343,15 @@ class MiredPayload(BaseModel):
     mireds: Optional[int] = None
 
 
+class FlowPayload(BaseModel):
+    id: str
+    base: int = 25            # overcast brightness (1-100); caller derives from schedule x scale
+    peak: int = 100           # lightning-flash brightness (1-100); caller's scheduled level
+    kelvin: int = 4500        # overcast colour temperature
+    lightning: bool = False   # add lightning flashes (heavy/violent rain)
+    flash_kelvin: int = 6000  # cool colour of the lightning flash
+
+
 class NamePayload(BaseModel):
     id: Optional[str] = None
     bulb_id: Optional[str] = None  # legacy
@@ -525,6 +538,85 @@ def mired(request: Request, payload: Optional[MiredPayload] = None):
         bulb.turn_on()
         bulb.set_color_temp(kelvin, duration=1000)
         return {"status": "success", "id": p["id"], "mireds": mireds_val}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -- Colour flow (on-device animation, e.g. rain/overcast/lightning) ---------
+
+FLOW_K_MIN, FLOW_K_MAX = 1700, 6500  # Yeelight tunable-white range (Kelvin)
+
+
+def _clampb(v: int) -> int:
+    return max(1, min(100, int(round(v))))
+
+
+def _clampk(v: int) -> int:
+    return max(FLOW_K_MIN, min(FLOW_K_MAX, int(v)))
+
+
+def _build_rain_flow(base: int, peak: int, kelvin: int,
+                     lightning: bool, flash_kelvin: int) -> Flow:
+    """An overcast-sky animation on the main (white) channel.
+
+    Brightness is absolute (Yeelight flows can't scale), so the CALLER passes
+    `base` (= scheduled level x rain intensity_scale) and `peak` (= the scheduled
+    level) — both already synced to light_programmer's circadian schedule. The
+    flow wobbles gently around `base` like moving cloud, and, when `lightning`,
+    flashes up toward `peak` in a cool colour, then settles back with a dark
+    pause. Runs forever (count=0) until stopped.
+    """
+    b = _clampb(base)
+    lo = _clampb(b * 0.82)
+    hi = _clampb(b * 1.18)
+    t = [
+        TemperatureTransition(kelvin, duration=3500, brightness=lo),
+        TemperatureTransition(kelvin, duration=3500, brightness=hi),
+        TemperatureTransition(kelvin, duration=2500, brightness=b),
+    ]
+    if lightning:
+        p = _clampb(peak)
+        t += [
+            TemperatureTransition(flash_kelvin, duration=70,  brightness=p),
+            TemperatureTransition(flash_kelvin, duration=110, brightness=_clampb(b * 1.3)),
+            TemperatureTransition(flash_kelvin, duration=55,  brightness=_clampb(p * 0.85)),
+            TemperatureTransition(kelvin,       duration=300, brightness=lo),
+            SleepTransition(duration=2800),
+        ]
+    return Flow(count=0, action=Flow.actions.stay, transitions=t)
+
+
+@app.api_route("/api/flow", methods=["POST"])
+def start_flow(request: Request, payload: Optional[FlowPayload] = None):
+    p = _params(request, payload, ["id", "base", "peak", "kelvin", "lightning", "flash_kelvin"])
+    if not p["id"]:
+        raise HTTPException(status_code=400, detail="Missing device id")
+    bulb, _ = _bulb_for(p["id"])
+    flow = _build_rain_flow(
+        base=int(p.get("base") or 25),
+        peak=int(p.get("peak") or 100),
+        kelvin=_clampk(int(p.get("kelvin") or 4500)),
+        lightning=bool(p.get("lightning")),
+        flash_kelvin=_clampk(int(p.get("flash_kelvin") or 6000)),
+    )
+    try:
+        bulb.turn_on()
+        bulb.start_flow(flow, light_type=LightType.Main)
+        return {"status": "success", "id": p["id"], "flowing": True,
+                "base": int(p.get("base") or 25), "lightning": bool(p.get("lightning"))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.api_route("/api/flow/stop", methods=["POST"])
+def stop_flow(request: Request, payload: Optional[FlowPayload] = None):
+    p = _params(request, payload, ["id"])
+    if not p["id"]:
+        raise HTTPException(status_code=400, detail="Missing device id")
+    bulb, _ = _bulb_for(p["id"])
+    try:
+        bulb.stop_flow(light_type=LightType.Main)
+        return {"status": "success", "id": p["id"], "flowing": False}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
