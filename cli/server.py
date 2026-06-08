@@ -562,17 +562,30 @@ def _build_rain_flow(base: int, peak: int, kelvin: int,
     Brightness is absolute (Yeelight flows can't scale), so the CALLER passes
     `base` (= scheduled level x rain intensity_scale) and `peak` (= the scheduled
     level) — both already synced to light_programmer's circadian schedule. The
-    flow wobbles gently around `base` like moving cloud, and, when `lightning`,
-    flashes up toward `peak` in a cool colour, then settles back with a dark
-    pause. Runs forever (count=0) until stopped.
+    flow shivers quickly and irregularly around `base` like rain on an overcast
+    skylight — many short steps, biased downward (mostly dimmer than `base`, with
+    brief lifts) — and, when `lightning`, flashes up toward `peak` in a cool
+    colour, then settles back with a dark pause. Runs forever (count=0) until
+    stopped.
     """
     b = _clampb(base)
-    lo = _clampb(b * 0.82)
-    hi = _clampb(b * 1.18)
+    lo = _clampb(b * 0.55)
+
+    def step(factor: float, ms: int) -> TemperatureTransition:
+        return TemperatureTransition(kelvin, duration=ms, brightness=_clampb(b * factor))
+
+    # Short, uneven steps -> the light "rains" rather than slowly breathing.
+    # Factors stay mostly < 1 (overcast is dim) with the odd brief brightening;
+    # ~6 s irregular loop with 8 brightness changes (vs 3 over ~9.5 s before).
     t = [
-        TemperatureTransition(kelvin, duration=3500, brightness=lo),
-        TemperatureTransition(kelvin, duration=3500, brightness=hi),
-        TemperatureTransition(kelvin, duration=2500, brightness=b),
+        step(0.72, 800),
+        step(1.08, 520),
+        step(0.58, 900),
+        step(0.90, 480),
+        step(0.66, 820),
+        step(1.02, 560),
+        step(0.55, 880),
+        step(0.84, 640),
     ]
     if lightning:
         p = _clampb(peak)
