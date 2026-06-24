@@ -108,11 +108,19 @@ def live_server(isolated_workdir):
 
 
 @pytest.fixture(autouse=True)
-def restore_bulb(raw_bulb):
-    """Leave the bulb on at a sane state after each test."""
+def restore_bulb():
+    """Leave the bulb on at a sane state after each test (real-device runs only).
+
+    Resolves the bulb lazily from the env so hardware-free unit tests aren't
+    skipped by depending on the real-device fixtures.
+    """
     yield
+    ip = os.environ.get("YEELIGHT_TEST_IP")
+    if not ip:
+        return
     try:
-        raw_bulb.turn_on()
-        raw_bulb.set_brightness(50, duration=200)
+        bulb = Bulb(ip)
+        bulb.turn_on()
+        bulb.set_brightness(50, duration=200)
     except Exception:
         pass

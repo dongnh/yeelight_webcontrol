@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yeelight-web-controller"
-version = "0.5.1"
+version = "0.6.0"
 description = "Yeelight LAN control bridge — REST API compatible with matter_webcontrol federation."
 readme = "README.md"
 requires-python = ">=3.12"

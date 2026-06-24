@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import socket
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -24,6 +25,15 @@ try:
     from yeelight.transitions import TemperatureTransition, SleepTransition
 except ImportError:  # older layouts expose them from yeelight.flow
     from yeelight.flow import TemperatureTransition, SleepTransition
+
+try:  # models with a physical night-light (moonlight) channel
+    from yeelight.main import _MODEL_SPECS as _YEE_MODEL_SPECS
+    _MOONLIGHT_MODELS = frozenset(
+        m for m, s in _YEE_MODEL_SPECS.items() if s.get("night_light")
+    )
+except Exception:  # pragma: no cover - defensive: upstream layout changed
+    logging.warning("yeelight._MODEL_SPECS unavailable; moonlight disabled for all models")
+    _MOONLIGHT_MODELS = frozenset()
 
 CACHE_FILE = "cache.json"
 NAMES_FILE = "names.json"
@@ -95,7 +105,9 @@ def _raw_to_pct(raw: int) -> int:
 
 def _read_props(ip: str) -> Optional[dict]:
     try:
-        return Bulb(ip).get_properties(["power", "bright", "ct"])
+        return Bulb(ip).get_properties(
+            ["power", "bright", "ct", "active_mode"]
+        )
     except Exception:
         return None
 
@@ -105,12 +117,17 @@ def _build_device_entry(ip: str, bulb_id: str, model: str,
     bright_pct = int(props.get("bright") or 0)
     ct_kelvin = int(props.get("ct") or 0)
     on = (props.get("power") == "on")
+    # active_mode == "1" -> the bulb is on its night-light (moonlight) channel,
+    # whose real level lives in nl_br, not bright. Report "on at the floor" so the
+    # feed never shows the stale daylight brightness, and drop colour temperature
+    # (moonlight is a fixed warm white).
+    moonlit = on and props.get("active_mode") == "1"
 
     states: dict[str, Any] = {
         "on_off": on,
-        "brightness_raw": _pct_to_raw(bright_pct) if on else 0,
+        "brightness_raw": 1 if moonlit else (_pct_to_raw(bright_pct) if on else 0),
     }
-    if ct_kelvin > 0:
+    if ct_kelvin > 0 and not moonlit:
         states["color_temp_mireds"] = _kelvin_to_mireds(ct_kelvin)
 
     return {
@@ -311,6 +328,50 @@ def _bulb_for(device_id: str) -> tuple[Bulb, dict]:
     return Bulb(entry["ip"]), entry
 
 
+def _supports_moonlight(model: Optional[str]) -> bool:
+    """True only for models with a night-light channel (ceiling lights, bslamp2/3).
+
+    Gating on the cached SSDP model is the correct probe. The old
+    `"active_mode" in props` check was always true — get_prop returns "" for
+    unrecognised keys — so it switched non-night-light bulbs into mode 5.
+    """
+    return bool(model) and model in _MOONLIGHT_MODELS
+
+
+def _moonlight_capable(bulb: Bulb, entry: dict) -> bool:
+    """Model-based moonlight check, with a live probe for unidentified bulbs.
+
+    A known night-light model wins immediately; a known non-night-light model is
+    rejected without a round-trip. For an "unknown"/unset model (a bulb seeded by
+    IP before SSDP identified it) fall back to a value-based active_mode probe: a
+    non-empty active_mode ("0"/"1") proves the bulb has the night-light channel.
+    """
+    model = entry.get("model")
+    if _supports_moonlight(model):
+        return True
+    if model and model != "unknown":
+        return False
+    try:
+        props = bulb.get_properties(["active_mode"]) or {}
+        return props.get("active_mode") in ("0", "1")
+    except Exception:
+        return False
+
+
+_bulb_locks: dict[str, threading.Lock] = {}
+_bulb_locks_guard = threading.Lock()
+
+
+def _lock_for(ip: str) -> threading.Lock:
+    """Per-bulb write lock: base, moonlight, and flow share one socket on 55443."""
+    with _bulb_locks_guard:
+        lock = _bulb_locks.get(ip)
+        if lock is None:
+            lock = threading.Lock()
+            _bulb_locks[ip] = lock
+        return lock
+
+
 # ---------------------------------------------------------------------------
 # Auth middleware
 # ---------------------------------------------------------------------------
@@ -439,7 +500,7 @@ def set_device(request: Request, payload: Optional[ControlPayload] = None):
     if not p["id"]:
         raise HTTPException(status_code=400, detail="Missing device id")
 
-    bulb, _ = _bulb_for(p["id"])
+    bulb, entry = _bulb_for(p["id"])
     brightness = float(p["brightness"]) if p["brightness"] is not None else None
     temperature = int(p["temperature"]) if p["temperature"] is not None else None
 
@@ -449,20 +510,19 @@ def set_device(request: Request, payload: Optional[ControlPayload] = None):
             if brightness == 0.0:
                 bulb.turn_off()
             elif brightness < MOONLIGHT_THRESHOLD:
-                # Moonlight where supported, otherwise fall back to lowest normal.
-                supports_moonlight = False
-                try:
-                    props = bulb.get_properties(["active_mode"])
-                    supports_moonlight = bool(props and "active_mode" in props)
-                except Exception:
-                    pass
-                bulb.turn_on()
-                if supports_moonlight:
-                    bulb.set_power_mode(PowerMode.MOONLIGHT)
-                bulb.set_brightness(max(1, int(brightness * 100)), duration=1000)
+                # Moonlight where supported, otherwise the lowest normal level.
+                # Gate on the cached model — not a get_prop probe (see
+                # _supports_moonlight). Mode BEFORE brightness so set_brightness's
+                # ensure_on() doesn't re-power in NORMAL and write `bright`.
+                with _lock_for(entry["ip"]):
+                    bulb.turn_on()
+                    if _supports_moonlight(entry.get("model")):
+                        bulb.set_power_mode(PowerMode.MOONLIGHT)
+                    bulb.set_brightness(max(1, int(brightness * 100)), duration=1000)
             else:
                 bulb.turn_on()
-                bulb.set_power_mode(PowerMode.NORMAL)
+                if _supports_moonlight(entry.get("model")):
+                    bulb.set_power_mode(PowerMode.NORMAL)
                 bulb.set_brightness(int(brightness * 100), duration=1000)
 
         if temperature is not None and temperature > 0:
@@ -487,7 +547,7 @@ def level(request: Request, payload: Optional[LevelPayload] = None):
     if not p["id"]:
         raise HTTPException(status_code=400, detail="Missing device id")
 
-    bulb, _ = _bulb_for(p["id"])
+    bulb, entry = _bulb_for(p["id"])
 
     if p["level"] is None:
         try:
@@ -503,8 +563,13 @@ def level(request: Request, payload: Optional[LevelPayload] = None):
         if raw == 0:
             bulb.turn_off()
         else:
-            bulb.turn_on()
-            bulb.set_brightness(max(1, _raw_to_pct(raw)), duration=1000)
+            with _lock_for(entry["ip"]):
+                bulb.turn_on()
+                # Driving the main channel must leave moonlight; the raw path has
+                # no other way to clear mode 5 on a night-light-capable bulb.
+                if _supports_moonlight(entry.get("model")):
+                    bulb.set_power_mode(PowerMode.NORMAL)
+                bulb.set_brightness(max(1, _raw_to_pct(raw)), duration=1000)
         return {"status": "success", "id": p["id"], "level": raw}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -538,6 +603,63 @@ def mired(request: Request, payload: Optional[MiredPayload] = None):
         bulb.turn_on()
         bulb.set_color_temp(kelvin, duration=1000)
         return {"status": "success", "id": p["id"], "mireds": mireds_val}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -- Moonlight (night-light channel; ceiling lights + Bedside Lamp 2/3) ------
+
+class MoonlightPayload(BaseModel):
+    id: str
+    on: bool = True
+    level: Optional[int] = None  # nl_br 1-100 (night-light brightness)
+
+
+@app.api_route("/api/moonlight", methods=["POST"])
+def moonlight(request: Request, payload: Optional[MoonlightPayload] = None):
+    """Enter or leave the bulb's moonlight (night-light) channel.
+
+    light_programmer drives this directly (like /api/flow) for schedule points
+    in the sub-1 band (0 < level < 1 on the 0-100 scale), mapped linearly to
+    nl_br: level 0.1 -> 10%, 0.9 -> 90% (the `level` field here IS that nl_br,
+    1-100). Only ceiling lights and Bedside Lamp 2/3 have the channel; other
+    models fall back to the lowest normal brightness so the caller still gets a
+    dim light.
+    """
+    p = _params(request, payload, ["id", "on", "level"])
+    if not p["id"]:
+        raise HTTPException(status_code=400, detail="Missing device id")
+
+    on = p["on"]
+    if isinstance(on, str):
+        on = on.strip().lower() not in ("0", "false", "off", "no", "")
+    on = True if on is None else bool(on)
+
+    bulb, entry = _bulb_for(p["id"])
+    supported = _moonlight_capable(bulb, entry)
+    try:
+        with _lock_for(entry["ip"]):
+            # A running main-channel colour-flow owns the bulb; stop it before
+            # switching power mode or the bulb is left in an undefined state.
+            try:
+                bulb.stop_flow(light_type=LightType.Main)
+            except Exception:
+                pass
+            if not on:
+                bulb.turn_on()
+                bulb.set_power_mode(PowerMode.NORMAL)
+                return {"status": "success", "id": p["id"], "moonlight": False}
+            nl = 1 if p["level"] is None else max(1, min(100, int(p["level"])))
+            eff = nl if supported else 1  # no night-light channel -> lowest normal
+            bulb.turn_on()
+            if supported:
+                # Mode BEFORE brightness (ensure_on would re-power in NORMAL).
+                bulb.set_power_mode(PowerMode.MOONLIGHT)
+            bulb.set_brightness(eff, duration=1000)
+        return {"status": "success", "id": p["id"],
+                "moonlight": supported, "level": eff}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -604,7 +726,7 @@ def start_flow(request: Request, payload: Optional[FlowPayload] = None):
     p = _params(request, payload, ["id", "base", "peak", "kelvin", "lightning", "flash_kelvin"])
     if not p["id"]:
         raise HTTPException(status_code=400, detail="Missing device id")
-    bulb, _ = _bulb_for(p["id"])
+    bulb, entry = _bulb_for(p["id"])
     flow = _build_rain_flow(
         base=int(p.get("base") or 25),
         peak=int(p.get("peak") or 100),
@@ -613,8 +735,9 @@ def start_flow(request: Request, payload: Optional[FlowPayload] = None):
         flash_kelvin=_clampk(int(p.get("flash_kelvin") or 6000)),
     )
     try:
-        bulb.turn_on()
-        bulb.start_flow(flow, light_type=LightType.Main)
+        with _lock_for(entry["ip"]):
+            bulb.turn_on()
+            bulb.start_flow(flow, light_type=LightType.Main)
         return {"status": "success", "id": p["id"], "flowing": True,
                 "base": int(p.get("base") or 25), "lightning": bool(p.get("lightning"))}
     except Exception as e:
@@ -626,9 +749,10 @@ def stop_flow(request: Request, payload: Optional[FlowPayload] = None):
     p = _params(request, payload, ["id"])
     if not p["id"]:
         raise HTTPException(status_code=400, detail="Missing device id")
-    bulb, _ = _bulb_for(p["id"])
+    bulb, entry = _bulb_for(p["id"])
     try:
-        bulb.stop_flow(light_type=LightType.Main)
+        with _lock_for(entry["ip"]):
+            bulb.stop_flow(light_type=LightType.Main)
         return {"status": "success", "id": p["id"], "flowing": False}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
