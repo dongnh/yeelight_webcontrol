@@ -24,6 +24,12 @@ A factory reset is the one thing that mints a new hardware ID. Reset a bulb, upd
 
 This is how `light_programmer`'s rain `"effect": "flow"` drives the bulb: the schedule loop hands off, the bulb animates on its own, and the loop steps out of the level-control path until the rain clears.
 
+## Moonlight
+
+Some Yeelights carry a second, physical light source — a dim warm night-light. Ceiling lights have it, and so do Bedside Lamp 2 and 3. `/api/moonlight` switches a bulb onto it: send `on` with a `level` from 1 to 100 and the bulb drops to its night-light channel at that brightness; send `on: false` and it returns to the normal channel. The server gates on the bulb's model, so a bulb without the channel quietly falls back to the lowest normal brightness rather than failing — the caller always gets a dim light. A running colour-flow is stopped first, so the power-mode switch is never ambiguous.
+
+This is how `light_programmer` renders the bottom of its brightness range: a schedule level between off and the first daylight step routes here instead of to `/api/level`, and an artificial skylight glows like moonlight overnight instead of going dark.
+
 ## API surface
 
 Read: `GET /api/devices`, `GET /api/lights`, `GET /api/metadata`, `GET /api/level`, `GET /api/mired`.
@@ -31,6 +37,8 @@ Read: `GET /api/devices`, `GET /api/lights`, `GET /api/metadata`, `GET /api/leve
 Control: `POST /api/set`, `POST /api/level`, `POST /api/mired`.
 
 Animation: `POST /api/flow`, `POST /api/flow/stop`.
+
+Night-light: `POST /api/moonlight`.
 
 Discovery and aliases: `GET /api/refresh`, `GET /api/seed`, `GET /api/probe`, `POST /api/name`, `GET /api/name/remove`.
 
@@ -60,9 +68,9 @@ Only colour-temperature and dimmable LAN-control bulbs are tested. RGB-only mode
 
 ## Tests
 
-The suite drives a real bulb and is skipped by default until you provide one over environment variables. It covers the federation feed, the v2 metadata schema, level and mireds set/get/clamp, float-brightness control, alias add/remove, header auth, and an end-to-end pass that mirrors the calls a logical bridge makes.
+The suite drives a real bulb and is skipped by default until you provide one over environment variables. It covers the federation feed, the v2 metadata schema, level and mireds set/get/clamp, float-brightness control, alias add/remove, header auth, and an end-to-end pass that mirrors the calls a logical bridge makes. The moonlight model gate and night-light state reporting are checked by hardware-free unit tests that always run.
 
 ## Related projects
 
 - [`matter_webcontrol`](https://github.com/dongnh/matter_webcontrol) — the Matter-side server this bridge federates into.
-- [`light_programmer`](https://github.com/dongnh/light_programmer) — schedule engine that uses `/api/flow` as its rain colour-flow target.
+- [`light_programmer`](https://github.com/dongnh/light_programmer) — schedule engine that uses `/api/flow` for its rain colour-flow and `/api/moonlight` for sub-one schedule levels.
