@@ -10,11 +10,15 @@ Everything is REST. No embedded scripts. No `exec`. One header for auth.
 
 ## How it works
 
-The server keeps a small cache of every bulb it knows — hardware ID, IP, model, last-seen state. SSDP populates it while bulbs are broadcasting. A TCP probe on port 55443 fills the gaps when they aren't. The federation feed mirrors the schema a logical bridge consumes: level, color temperature in mireds, on/off, names, and `bridge.api_version: "2"`.
+The server keeps every bulb warm. Each bulb gets one long-lived LAN connection, reused across commands, so a control call or a state read rides an already-open socket instead of paying a fresh TCP handshake every time. Access to each bulb is serialised, so the main channel, the night-light channel, and a colour-flow never collide on the one socket the bulb allows.
 
-Every bulb has one true name: its hardware ID, a hex string the bulb reports over SSDP. It belongs to the bulb. It survives restarts, DHCP changes, and the bulb moving to a new IP. Store it, pin to it, address bulbs by it.
+Reads are answered from memory. The federation feed — level, colour temperature in mireds, on/off, names, `bridge.api_version: "2"` — is served from an in-memory snapshot that a background refresh keeps current, so a poll from a logical bridge returns in about a millisecond and never blocks on the network. SSDP, which takes a fixed two seconds and goes silent on long-running bulbs, is kept off that path: it runs only when a bulb is still unidentified, or on a long throttle.
 
-`yeelight_<ip>` is a placeholder, not an address. The server uses it when you register a bulb by IP before SSDP has identified it. The first time SSDP sees that bulb, the placeholder is replaced by the hardware ID, permanently. Downstream peers that registered during the placeholder window will need to refresh — on a federated `matter_webcontrol`, re-register the bridge to pick up the change. Aliases set with `/api/name` are for people, not lookups; the server only resolves commands against the canonical ID.
+The bulb roster is sticky. Each bulb's identity — hardware ID, model, IP — is resolved once by asking the bulb directly (a unicast capability probe that answers in milliseconds, even when broadcast discovery hears nothing), and then it stays. A bulb that misses a single read because of a transient stall is kept on the roster, marked unreachable, with its last-known state — not dropped. A long-running ceiling light can't quietly fall out of the federation because of one timeout, and a seeded bulb is known by its permanent hex ID from the first request rather than the `yeelight_<ip>` placeholder.
+
+Every bulb has one true name: its hardware ID, a hex string the bulb reports. It belongs to the bulb. It survives restarts, DHCP changes, and the bulb moving to a new IP. Store it, pin to it, address bulbs by it.
+
+`yeelight_<ip>` is a placeholder, not an address — used only in the rare case where a seeded bulb never answers the capability probe. Once the hardware ID is known it replaces the placeholder permanently and is persisted, so it survives restarts. Aliases set with `/api/name` are for people, not lookups; the server only resolves commands against the canonical ID.
 
 A factory reset is the one thing that mints a new hardware ID. Reset a bulb, update what you've pinned.
 
@@ -50,7 +54,7 @@ Requires Python 3.12 or later, and LAN Control switched on for each bulb in the 
 
 Install from PyPI as `yeelight-web-controller`, or editable from a checkout. Start with `yeelight-srv`, bind to a host and port, and provide an API key when exposing the service on the LAN. `--seed-ip` and `--probe-subnet` reach bulbs when SSDP is silent; `--auto-probe` scans the local /24 on the first request when discovery and cache come back empty.
 
-Seeding is about reach, not identity. Once SSDP sees a seeded bulb, the hardware ID takes over.
+A seeded bulb is identified up front: at seed time the server asks the bulb for its hardware ID and model directly, so it joins the roster under its permanent hex ID — no waiting for broadcast SSDP. Tuning knobs (env): `YEELIGHT_STATE_TTL` (snapshot freshness, default 10s), `YEELIGHT_SSDP_THROTTLE` (min seconds between broadcast sweeps, default 300s).
 
 ## Federation
 
@@ -58,9 +62,9 @@ Pair the service with a running `matter-srv` and your Yeelight bulbs join your M
 
 ## Known limits
 
-SSDP goes quiet on long-running bulbs. Yeelight broadcasts `NOTIFY` only for a short window after power-on; after that, discovery returns nothing even though TCP/55443 still answers. Reach them with `--auto-probe`, `--seed-ip`, or `/api/probe`.
+SSDP goes quiet on long-running bulbs. Yeelight broadcasts `NOTIFY` only for a short window after power-on; after that, broadcast discovery returns nothing even though TCP/55443 still answers. This no longer hurts identity — a seeded bulb is identified by a unicast capability probe to its own IP, which keeps answering — but a brand-new bulb you haven't pinned still needs `--seed-ip`, `--probe-subnet`, or `/api/probe` to be found.
 
-Bulbs occasionally drop off the LAN, roughly every two weeks. The only known recovery is a hardware power-cycle — the LAN protocol exposes no reboot command, so this needs a smart plug upstream or someone at the wall switch.
+Bulbs occasionally drop off the LAN, roughly every two weeks. The only known recovery is a hardware power-cycle — the LAN protocol exposes no reboot command, so this needs a smart plug upstream or someone at the wall switch. While a bulb is gone it stays on the roster marked unreachable (`reachable: false` in `/api/lights`) with its last-known state, rather than vanishing.
 
 The probe scans one /24 per local interface. Multi-VLAN setups need an explicit `--probe-subnet` per network.
 
@@ -68,7 +72,14 @@ Only colour-temperature and dimmable LAN-control bulbs are tested. RGB-only mode
 
 ## Tests
 
-The suite drives a real bulb and is skipped by default until you provide one over environment variables. It covers the federation feed, the v2 metadata schema, level and mireds set/get/clamp, float-brightness control, alias add/remove, header auth, and an end-to-end pass that mirrors the calls a logical bridge makes. The moonlight model gate and night-light state reporting are checked by hardware-free unit tests that always run.
+Two layers. Hardware-free unit tests always run and need no bulb: they cover the moonlight model gate, night-light state reporting, and the whole caching layer — sticky identity (a failed read never drops a known bulb, the hex ID never degrades), the SSDP-skip decision, the in-memory snapshot TTL, atomic/corruption-safe persistence, scan-input validation, and the optimistic state patch.
+
+The real-device suites drive the actual bulbs and are skipped until you point them at one or more over `YEELIGHT_TEST_IPS` (comma-separated, e.g. `YEELIGHT_TEST_IPS=192.168.1.7,192.168.1.236`; `YEELIGHT_TEST_IP` still works for a single bulb). They split into read-only checks — identity resolution, the federation device list, stable metadata classification, warm-snapshot poll latency, connection-pool reuse — which never change what the lights are doing, and `@pytest.mark.mutating` checks that actually drive level, colour temperature, and the moonlight channel on every configured bulb. Run everything safe with `-m "not mutating"`; run the light-changing ones with `-m mutating`.
+
+```bash
+pytest -m "not mutating"          # hardware-free + read-only real-device
+YEELIGHT_TEST_IPS=192.168.1.7,192.168.1.236 pytest -m mutating   # drives the bulbs
+```
 
 ## Related projects
 

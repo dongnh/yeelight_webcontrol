@@ -4,6 +4,27 @@ Implements the same API contract that matter_webcontrol v0.25.0
 LogicalBridgeClient expects, so a Matter server can register this
 service via `/api/bridge?ip=&port=&api_key=` and federate Yeelight
 bulbs alongside its native Matter devices.
+
+Connection model (v0.8.0)
+-------------------------
+The bridge keeps every bulb warm instead of reconnecting per request:
+
+  * Bulb pool          one persistent `yeelight.Bulb` per IP, so the LAN
+                       socket is reused across commands (python-yeelight
+                       reconnects it automatically on error). A per-IP
+                       re-entrant lock serialises ALL access to that socket.
+  * Identity cache     `cache.json` is a STICKY id/model store keyed by IP.
+                       A transient read failure never drops a known bulb, so
+                       a long-running ceiling light cannot vanish from the
+                       roster. Identity is resolved at seed time via a unicast
+                       `get_capabilities` probe (~150 ms) so a seeded bulb gets
+                       its hardware id + real model immediately, without waiting
+                       for broadcast SSDP (which long-running bulbs ignore).
+  * State snapshot     an in-memory `(states, timestamp)` snapshot serves the
+                       federation read path. Polls within `STATE_TTL` are
+                       answered from memory (~0 ms); a background thread keeps
+                       it warm. Broadcast SSDP only runs when a bulb is still
+                       unidentified or on a long throttle — never on every poll.
 """
 
 import argparse
@@ -12,7 +33,9 @@ import json
 import logging
 import os
 import socket
+import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -26,14 +49,18 @@ try:
 except ImportError:  # older layouts expose them from yeelight.flow
     from yeelight.flow import TemperatureTransition, SleepTransition
 
-try:  # models with a physical night-light (moonlight) channel
+try:  # models with a physical night-light (moonlight) channel + CT-capable models
     from yeelight.main import _MODEL_SPECS as _YEE_MODEL_SPECS
     _MOONLIGHT_MODELS = frozenset(
         m for m, s in _YEE_MODEL_SPECS.items() if s.get("night_light")
     )
+    _CT_MODELS = frozenset(
+        m for m, s in _YEE_MODEL_SPECS.items() if s.get("color_temp")
+    )
 except Exception:  # pragma: no cover - defensive: upstream layout changed
     logging.warning("yeelight._MODEL_SPECS unavailable; moonlight disabled for all models")
     _MOONLIGHT_MODELS = frozenset()
+    _CT_MODELS = frozenset()
 
 CACHE_FILE = "cache.json"
 NAMES_FILE = "names.json"
@@ -44,6 +71,13 @@ MOONLIGHT_THRESHOLD = 0.01  # brightness < 1% triggers moonlight where supported
 YEELIGHT_PORT = 55443  # Yeelight LAN protocol TCP port
 PROBE_TIMEOUT = 0.4    # per-host TCP connect timeout during subnet scan
 PROBE_WORKERS = 64     # parallel scan workers
+PROBE_MIN_PREFIX = 22  # reject subnet scans broader than a /22 (anti-abuse)
+
+# Cache / connection tuning (overridable via env for tests).
+STATE_TTL = float(os.environ.get("YEELIGHT_STATE_TTL", "10"))       # serve memory snapshot up to this age
+SSDP_THROTTLE = float(os.environ.get("YEELIGHT_SSDP_THROTTLE", "300"))  # min seconds between broadcast SSDP sweeps
+CAPS_TIMEOUT = float(os.environ.get("YEELIGHT_CAPS_TIMEOUT", "2"))  # unicast get_capabilities timeout
+POOL_READ_TIMEOUT = float(os.environ.get("YEELIGHT_POOL_READ_TIMEOUT", "3"))  # warm-socket read timeout
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -51,8 +85,11 @@ app = FastAPI(title="Yeelight Web Controller")
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# Persistence  (atomic, race-safe)
 # ---------------------------------------------------------------------------
+
+_io_guard = threading.Lock()   # serialises cache.json / names.json read-modify-write
+
 
 def load_json(path: str) -> dict:
     if not os.path.exists(path):
@@ -60,17 +97,35 @@ def load_json(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
+    except json.JSONDecodeError as e:
+        # A corrupt file (e.g. an interrupted write) must NOT be silently
+        # overwritten — move it aside so it is recoverable, then start clean.
+        try:
+            os.replace(path, path + ".corrupt")
+            logging.error(f"Corrupt {path} moved to {path}.corrupt: {e}")
+        except Exception as mv:
+            logging.error(f"Corrupt {path} could not be quarantined: {mv}")
+        return {}
     except Exception as e:
         logging.error(f"Read error {path}: {e}")
         return {}
 
 
 def save_json(path: str, data: dict) -> None:
-    tmp = path + ".tmp"
+    """Atomically replace `path`. A unique temp file per writer avoids the
+    shared-`.tmp` clobber when two threads persist the same target at once."""
+    dirn = os.path.dirname(path) or "."
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(dir=dirn, prefix=os.path.basename(path) + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)  # atomic on the same filesystem
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
     except Exception as e:
         logging.error(f"Write error {path}: {e}")
 
@@ -103,13 +158,8 @@ def _raw_to_pct(raw: int) -> int:
     return max(0, min(100, int(round(raw / 254.0 * 100))))
 
 
-def _read_props(ip: str) -> Optional[dict]:
-    try:
-        return Bulb(ip).get_properties(
-            ["power", "bright", "ct", "active_mode"]
-        )
-    except Exception:
-        return None
+def _is_provisional(bulb_id: Optional[str]) -> bool:
+    return (not bulb_id) or str(bulb_id).startswith("yeelight_")
 
 
 def _build_device_entry(ip: str, bulb_id: str, model: str,
@@ -138,6 +188,393 @@ def _build_device_entry(ip: str, bulb_id: str, model: str,
         "names": names,
         "states": states,
     }
+
+
+def _device_class(model: Optional[str], states: dict) -> tuple[str, list[str]]:
+    """Stable hardware_type + capability list.
+
+    Derived from the bulb MODEL when the model is known, so a CT light does not
+    reclassify itself to a plain dimmable light the moment it enters moonlight
+    (which transiently drops color_temp_mireds from its reported states). Falls
+    back to the live states only for an unidentified model.
+    """
+    caps = []
+    if "on_off" in states or model:
+        caps.append("on_off")
+    if "brightness_raw" in states or model:
+        caps.append("brightness")
+
+    if model in _CT_MODELS or "color_temp_mireds" in states:
+        caps.append("color_temperature")
+        return "color_temperature_light", caps
+    if "brightness_raw" in states or model:
+        return "dimmable_light", caps
+    return "on_off_light", caps
+
+
+# ---------------------------------------------------------------------------
+# Bulb connection pool — one warm socket per IP, serialised per IP
+# ---------------------------------------------------------------------------
+
+_bulbs: dict[str, Bulb] = {}
+_bulbs_guard = threading.Lock()
+_bulb_locks: dict[str, threading.RLock] = {}
+_bulb_locks_guard = threading.Lock()
+
+
+def _lock_for(ip: str) -> threading.RLock:
+    """Per-bulb RLock: base, moonlight, flow, AND reads share one socket on 55443.
+
+    Re-entrant so a control handler that already holds the lock can call a
+    capability probe (which re-acquires it) without deadlocking.
+    """
+    with _bulb_locks_guard:
+        lock = _bulb_locks.get(ip)
+        if lock is None:
+            lock = threading.RLock()
+            _bulb_locks[ip] = lock
+        return lock
+
+
+def _bulb_obj(ip: str) -> Bulb:
+    """Return the process-wide persistent Bulb for `ip`, creating it once.
+
+    python-yeelight's Bulb lazily opens its TCP socket and reuses it across
+    commands, reconnecting on socket error — so keeping one instance per IP
+    keeps the connection warm and avoids a cold handshake on every request.
+    """
+    with _bulbs_guard:
+        b = _bulbs.get(ip)
+        if b is None:
+            b = Bulb(ip, auto_on=False)
+            _bulbs[ip] = b
+        return b
+
+
+def _tighten_socket(bulb: Bulb) -> None:
+    """Lower the warm socket's read timeout so a stalled read can't pin the per-IP
+    lock — and thus block a control write to the same bulb — for python-yeelight's
+    default 5 s. Touches the already-open socket only (no reconnect)."""
+    try:
+        sock = getattr(bulb, "_Bulb__socket", None)
+        if sock is not None:
+            sock.settimeout(POOL_READ_TIMEOUT)
+    except Exception:
+        pass
+
+
+def _read_props(ip: str) -> Optional[dict]:
+    try:
+        with _lock_for(ip):
+            b = _bulb_obj(ip)
+            props = b.get_properties(["power", "bright", "ct", "active_mode"])
+            _tighten_socket(b)
+            return props
+    except Exception:
+        return None
+
+
+def _resolve_identity(ip: str) -> tuple[Optional[str], Optional[str]]:
+    """Learn a bulb's (hardware id, model) via a unicast get_capabilities probe.
+
+    Unlike broadcast `discover_bulbs`, this M-SEARCHes the bulb's own IP and
+    returns in ~150 ms even for long-running bulbs that no longer emit SSDP
+    NOTIFY frames — so a seeded-by-IP bulb gets its canonical hex id and real
+    model immediately, eliminating the `yeelight_<ip>` / model="unknown" window.
+    """
+    try:
+        with _lock_for(ip):
+            caps = _bulb_obj(ip).get_capabilities(timeout=CAPS_TIMEOUT) or {}
+        return caps.get("id"), caps.get("model")
+    except Exception:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# In-memory state snapshot + background refresh
+# ---------------------------------------------------------------------------
+
+_state_cache: dict[str, dict] = {}     # ip -> device entry (with live states)
+_state_ts: float = 0.0                  # monotonic timestamp of the snapshot
+_state_guard = threading.Lock()
+_last_ssdp: float = 0.0                  # monotonic time of the last broadcast sweep
+
+_bg_started = False
+_bg_guard = threading.Lock()
+
+
+def _publish_snapshot(active: dict[str, dict]) -> None:
+    """Replace the whole snapshot (used by a full refresh)."""
+    global _state_ts
+    with _state_guard:
+        _state_cache.clear()
+        _state_cache.update({ip: dict(e) for ip, e in active.items()})
+        _state_ts = time.monotonic()
+
+
+def _merge_snapshot(entries: dict[str, dict]) -> None:
+    """Merge entries into the snapshot without clearing it (used by seed) so a
+    runtime seed can't wipe the live states of bulbs it didn't touch."""
+    global _state_ts
+    with _state_guard:
+        for ip, e in entries.items():
+            _state_cache[ip] = dict(e)
+        _state_ts = time.monotonic()
+
+
+def _patch_state(ip: str, **state_fields) -> None:
+    """Optimistically reflect a just-confirmed control write in the snapshot so a
+    federation poll within STATE_TTL sees the new value; the next refresh reconciles."""
+    with _state_guard:
+        entry = _state_cache.get(ip)
+        if not entry:
+            return
+        entry = dict(entry)
+        states = dict(entry.get("states", {}))
+        for k, v in state_fields.items():
+            if v is None:
+                states.pop(k, None)
+            else:
+                states[k] = v
+        entry["states"] = states
+        _state_cache[ip] = entry
+
+
+def _identity_changed(prev: dict, entry: dict, ip: str) -> bool:
+    return (
+        prev.get("id") != entry.get("id")
+        or prev.get("model") != entry.get("model")
+        or prev.get("ip") != ip
+        or prev.get("names") != entry.get("names")
+    )
+
+
+_refresh_lock = threading.Lock()  # single-flight: coalesce concurrent refreshes
+
+
+def _identity_only(entry: dict) -> dict:
+    """Project an entry to its persistent identity fields (no volatile state)."""
+    return {k: entry[k] for k in ("id", "endpoint_id", "ip", "model", "names") if k in entry}
+
+
+def _dedupe_by_id(active: dict[str, dict]) -> dict[str, dict]:
+    """After a DHCP move a bulb can briefly appear under its old and new IP with the
+    same hardware id. Keep only the reachable copy so _find_by_id never resolves to
+    the dead address."""
+    chosen: dict[str, str] = {}  # id -> winning ip
+    for ip, e in active.items():
+        bid = e.get("id")
+        if not bid:
+            continue
+        cur = chosen.get(bid)
+        if cur is None or (e.get("reachable") and not active[cur].get("reachable")):
+            chosen[bid] = ip
+    keep = set(chosen.values()) | {ip for ip, e in active.items() if not e.get("id")}
+    return {ip: e for ip, e in active.items() if ip in keep}
+
+
+def _do_refresh(timeout: int = 2, allow_probe: bool = True,
+                force_ssdp: bool = False) -> dict[str, dict]:
+    global _last_ssdp
+    with _io_guard:
+        known = load_json(CACHE_FILE)
+    names = load_names()
+    with _state_guard:
+        live = {ip: dict(e) for ip, e in _state_cache.items()}
+
+    now = time.monotonic()
+    unidentified = (not known) or any(
+        _is_provisional(e.get("id")) or e.get("model") in (None, "", "unknown")
+        for e in known.values()
+    )
+    do_ssdp = force_ssdp or unidentified or (now - _last_ssdp >= SSDP_THROTTLE)
+
+    by_ip: dict[str, dict] = {}
+    if do_ssdp:
+        _last_ssdp = now
+        try:
+            for b in discover_bulbs(timeout=timeout):
+                if b.get("ip"):
+                    by_ip[b["ip"]] = b
+        except Exception as e:
+            logging.warning(f"discover_bulbs failed: {e}")
+
+    # One-shot subnet probe fallback (only when truly empty), unchanged contract.
+    if allow_probe and not by_ip and not known and getattr(app.state, "auto_probe", False):
+        logging.info("SSDP returned 0 bulbs and cache is empty — running TCP probe")
+        probe_and_seed()
+        with _io_guard:
+            known = load_json(CACHE_FILE)
+
+    all_ips = set(known.keys()) | set(by_ip.keys())
+
+    active: dict[str, dict] = {}
+    identity_changed = False
+    for ip in all_ips:
+        prev = known.get(ip, {})
+        caps = (by_ip.get(ip, {}) or {}).get("capabilities") or {}
+        bulb_id = caps.get("id") or prev.get("id") or f"yeelight_{ip}"
+        model = caps.get("model") or prev.get("model") or "unknown"
+
+        # Still provisional after SSDP/cache? Upgrade via a cheap unicast probe.
+        if _is_provisional(bulb_id) or model in (None, "", "unknown"):
+            rid, rmodel = _resolve_identity(ip)
+            if rid:
+                bulb_id = rid
+            if rmodel:
+                model = rmodel
+
+        props = _read_props(ip)
+        if props is not None:
+            entry = _build_device_entry(ip, bulb_id, model, props, names.get(bulb_id, []))
+            entry["reachable"] = True
+        elif prev or live.get(ip):
+            # STICKY: keep the known bulb, preserving the LAST-KNOWN LIVE states from
+            # the in-memory snapshot (incl. optimistic writes) — NOT the disk entry,
+            # which is identity-only. A transient read failure must not make a
+            # physically-on ceiling light report OFF on the federation feed.
+            base = dict(live.get(ip) or prev)
+            base["id"] = bulb_id
+            base["model"] = model
+            base["ip"] = ip
+            base["endpoint_id"] = prev.get("endpoint_id", base.get("endpoint_id", 1))
+            base["names"] = names.get(bulb_id, prev.get("names", base.get("names", [])))
+            base.setdefault("states", {"on_off": False, "brightness_raw": 0})
+            base["reachable"] = False
+            entry = base
+        else:
+            continue  # brand-new IP that does not answer — nothing to keep
+
+        if _identity_changed(prev, entry, ip):
+            identity_changed = True
+        active[ip] = entry
+
+    active = _dedupe_by_id(active)
+
+    # Persist IDENTITY ONLY — volatile states live in the snapshot, not on disk, so a
+    # restart never resurrects stale brightness and the hot path never churns disk.
+    if identity_changed or set(active) != set(known):
+        with _io_guard:
+            disk = load_json(CACHE_FILE)
+            disk.update({ip: _identity_only(e) for ip, e in active.items()})
+            save_json(CACHE_FILE, disk)
+
+    _publish_snapshot(active)
+    return active
+
+
+def _refresh_devices(timeout: int = 2, allow_probe: bool = True,
+                     force_ssdp: bool = False,
+                     max_age: Optional[float] = None) -> dict[str, dict]:
+    """Single-flight wrapper around _do_refresh. Concurrent callers coalesce: a
+    caller whose `max_age` the snapshot already satisfies (because another thread
+    refreshed while it waited) returns that snapshot instead of refreshing again."""
+    with _refresh_lock:
+        if max_age is not None:
+            with _state_guard:
+                if _state_cache and (time.monotonic() - _state_ts) < max_age:
+                    return {ip: dict(e) for ip, e in _state_cache.items()}
+        return _do_refresh(timeout=timeout, allow_probe=allow_probe, force_ssdp=force_ssdp)
+
+
+def _ensure_background_refresh() -> None:
+    """Start a daemon that keeps the snapshot warm so federation polls never block."""
+    global _bg_started
+    with _bg_guard:
+        if _bg_started:
+            return
+        _bg_started = True
+
+    def _loop():
+        while True:
+            try:
+                _refresh_devices()
+            except Exception as e:  # pragma: no cover - defensive
+                logging.warning(f"background refresh failed: {e}")
+            # Refresh well within the serve TTL so the snapshot is republished before
+            # it lapses — a poll at the boundary then never blocks on a sync refresh.
+            time.sleep(max(1.0, STATE_TTL / 2))
+
+    threading.Thread(target=_loop, daemon=True, name="yeelight-refresh").start()
+
+
+def _devices_snapshot(max_age: Optional[float] = None) -> dict[str, dict]:
+    """Serve the federation read path from the in-memory snapshot when fresh,
+    otherwise refresh (single-flight). Starts the background warmer on first use."""
+    _ensure_background_refresh()
+    ttl = STATE_TTL if max_age is None else max_age
+    with _state_guard:
+        snap = {ip: dict(e) for ip, e in _state_cache.items()} if _state_cache else None
+        age = (time.monotonic() - _state_ts) if _state_cache else None
+    if snap is not None and age is not None and age < ttl:
+        return snap
+    return _refresh_devices(max_age=ttl)
+
+
+def probe_and_seed(subnets: Optional[list[str]] = None) -> dict[str, dict]:
+    """Probe local /24 subnet(s) for Yeelight bulbs and seed any found.
+
+    Used as a fallback when SSDP multicast discovery returns nothing
+    (bulbs only emit SSDP NOTIFY for a short window after power-on).
+    """
+    targets = subnets or _local_ipv4_subnets()
+    if not targets:
+        logging.warning("Probe: could not determine a local subnet")
+        return {}
+    discovered: list[str] = []
+    for subnet in targets:
+        logging.info(f"Probe: scanning {subnet} for port {YEELIGHT_PORT}")
+        try:
+            discovered.extend(probe_subnet(subnet))
+        except ValueError as e:
+            logging.error(str(e))
+    if not discovered:
+        logging.info("Probe: no Yeelight devices answering on port 55443")
+        return {}
+    return seed_ips(discovered)
+
+
+def seed_ips(ips: list[str]) -> dict[str, dict]:
+    """Probe each given IP directly and add it to the cache.
+
+    Resolves each bulb's canonical hardware id + model up front via a unicast
+    get_capabilities probe, so a seeded bulb is registered under its permanent
+    hex id (not the transient `yeelight_<ip>` placeholder) and its moonlight
+    capability is known immediately — even when broadcast SSDP is silent.
+    """
+    with _io_guard:
+        cache = load_json(CACHE_FILE)
+    names = load_names()
+    added = {}
+    identity_changed = False
+    for ip in ips:
+        props = _read_props(ip)
+        if not props:
+            logging.warning(f"Seed: {ip} unreachable on port 55443")
+            continue
+        existing = cache.get(ip, {})
+        bulb_id = existing.get("id")
+        model = existing.get("model")
+        if _is_provisional(bulb_id) or model in (None, "", "unknown"):
+            rid, rmodel = _resolve_identity(ip)
+            bulb_id = rid or bulb_id or f"yeelight_{ip}"
+            model = rmodel or model or "unknown"
+        entry = _build_device_entry(ip, bulb_id, model, props, names.get(bulb_id, []))
+        entry["reachable"] = True
+        if _identity_changed(existing, entry, ip):
+            identity_changed = True
+        added[ip] = entry
+        logging.info(f"Seed: registered {ip} as {bulb_id} (model {model})")
+    if added and identity_changed:
+        # Merge ONLY the freshly-resolved entries (identity only) so a concurrent
+        # refresh updating other IPs isn't lost.
+        with _io_guard:
+            disk = load_json(CACHE_FILE)
+            disk.update({ip: _identity_only(e) for ip, e in added.items()})
+            save_json(CACHE_FILE, disk)
+    if added:
+        _merge_snapshot(added)
+    return added
 
 
 def _local_ipv4_subnets() -> list[str]:
@@ -195,11 +632,20 @@ def _probe_host(ip: str, timeout: float = PROBE_TIMEOUT) -> bool:
 
 
 def probe_subnet(subnet: str) -> list[str]:
-    """Parallel TCP scan of `subnet` for hosts answering on port 55443."""
+    """Parallel TCP scan of `subnet` for hosts answering on port 55443.
+
+    Restricted to PRIVATE ranges no broader than /22 so the endpoint can't be
+    abused as a wide-area / public scan primitive.
+    """
     try:
         net = ipaddress.ip_network(subnet, strict=False)
     except ValueError as e:
         raise ValueError(f"Invalid subnet '{subnet}': {e}")
+    if not net.is_private:
+        raise ValueError(f"Refusing to scan non-private subnet '{subnet}'")
+    if net.prefixlen < PROBE_MIN_PREFIX:
+        raise ValueError(
+            f"Subnet '{subnet}' too large (min /{PROBE_MIN_PREFIX})")
 
     hosts = [str(h) for h in net.hosts()]
     found: list[str] = []
@@ -210,122 +656,40 @@ def probe_subnet(subnet: str) -> list[str]:
     return found
 
 
-def probe_and_seed(subnets: Optional[list[str]] = None) -> dict[str, dict]:
-    """Probe local /24 subnet(s) for Yeelight bulbs and seed any found.
-
-    Used as a fallback when SSDP multicast discovery returns nothing
-    (bulbs only emit SSDP NOTIFY for a short window after power-on).
-    """
-    targets = subnets or _local_ipv4_subnets()
-    if not targets:
-        logging.warning("Probe: could not determine a local subnet")
-        return {}
-    discovered: list[str] = []
-    for subnet in targets:
-        logging.info(f"Probe: scanning {subnet} for port {YEELIGHT_PORT}")
-        try:
-            discovered.extend(probe_subnet(subnet))
-        except ValueError as e:
-            logging.error(str(e))
-    if not discovered:
-        logging.info("Probe: no Yeelight devices answering on port 55443")
-        return {}
-    return seed_ips(discovered)
-
-
-def seed_ips(ips: list[str]) -> dict[str, dict]:
-    """Probe each given IP directly and add it to the cache.
-
-    Useful when SSDP multicast discovery is blocked or bulbs have been
-    powered on too long to broadcast their SSDP NOTIFY frames.
-    """
-    cache = load_json(CACHE_FILE)
-    names = load_names()
-    socket.setdefaulttimeout(3)
-    added = {}
-    for ip in ips:
-        props = _read_props(ip)
-        if not props:
-            logging.warning(f"Seed: {ip} unreachable on port 55443")
-            continue
-        existing = cache.get(ip, {})
-        # Keep an already-known id (a hardware id, once SSDP has identified the
-        # bulb), otherwise assign the provisional `yeelight_<ip>` placeholder.
-        # That placeholder is transient: the next refresh that sees the bulb
-        # over SSDP replaces it with the bulb's permanent hardware id. Address
-        # bulbs by the hardware id, not by this seeded value.
-        bulb_id = existing.get("id") or f"yeelight_{ip}"
-        model = existing.get("model") or "unknown"
-        cache[ip] = _build_device_entry(ip, bulb_id, model, props, names.get(bulb_id, []))
-        added[ip] = cache[ip]
-        logging.info(f"Seed: registered {ip} as {bulb_id}")
-    socket.setdefaulttimeout(10)
-    if added:
-        save_json(CACHE_FILE, cache)
-    return added
-
-
-def _refresh_devices(timeout: int = 2, allow_probe: bool = True) -> dict[str, dict]:
-    """Discover + probe every known/discovered bulb. Persists `cache.json`.
-
-    When SSDP discovery returns nothing AND the cache is empty, fall back to a
-    TCP scan of the local /24 subnet(s) — bulbs that have been on for a while
-    stop broadcasting SSDP NOTIFY frames.
-    """
-    known = load_json(CACHE_FILE)
-    names = load_names()
-
-    discovered = discover_bulbs(timeout=timeout)
-    by_ip = {b["ip"]: b for b in discovered if b.get("ip")}
-
-    if allow_probe and not by_ip and not known and getattr(app.state, "auto_probe", False):
-        logging.info("SSDP returned 0 bulbs and cache is empty — running TCP probe")
-        probe_and_seed()
-        known = load_json(CACHE_FILE)
-
-    all_ips = set(known.keys()) | set(by_ip.keys())
-
-    socket.setdefaulttimeout(3)
-    active: dict[str, dict] = {}
-    for ip in all_ips:
-        props = _read_props(ip)
-        if not props:
-            continue
-        caps = by_ip.get(ip, {}).get("capabilities") or {}
-        # Canonical identity, in priority order:
-        #   1. SSDP capabilities.id — the bulb's permanent hardware id (hex).
-        #   2. The id already in the cache (a hardware id once SSDP has seen it).
-        #   3. `yeelight_<ip>` — provisional fallback before SSDP ever identifies
-        #      the bulb. As soon as (1) is available it wins and is persisted, so
-        #      a seeded `yeelight_<ip>` upgrades to the hardware id permanently.
-        bulb_id = caps.get("id") or known.get(ip, {}).get("id") or f"yeelight_{ip}"
-        model = caps.get("model") or known.get(ip, {}).get("model") or "unknown"
-        active[ip] = _build_device_entry(ip, bulb_id, model, props, names.get(bulb_id, []))
-    socket.setdefaulttimeout(10)
-
-    if active != known:
-        save_json(CACHE_FILE, active)
-    return active
-
-
 def _find_by_id(device_id: str, cache: Optional[dict] = None) -> Optional[dict]:
     """Resolve a device by its canonical `id` (the bulb's hardware id).
 
     Matches the canonical id only. Aliases registered via `/api/name` live in
-    `names[]` for display and are deliberately not resolvable as ids.
+    `names[]` for display and are deliberately not resolvable as ids. Looks at
+    the in-memory snapshot first, then the on-disk identity cache.
     """
-    cache = cache if cache is not None else load_json(CACHE_FILE)
+    if cache is None:
+        with _state_guard:
+            cache = {ip: dict(e) for ip, e in _state_cache.items()}
+        if not cache:
+            with _io_guard:
+                cache = load_json(CACHE_FILE)
+    match = None
     for entry in cache.values():
         if entry.get("id") == device_id:
-            return entry
-    return None
+            # Prefer a reachable copy if the same id appears under two IPs
+            # (e.g. mid-DHCP-move); fall back to whatever matched.
+            if entry.get("reachable", True):
+                return entry
+            match = match or entry
+    return match
 
 
 def _bulb_for(device_id: str) -> tuple[Bulb, dict]:
     entry = _find_by_id(device_id)
     if not entry:
+        # The snapshot may be cold for a just-restarted process; force a lookup
+        # against the on-disk identity cache before giving up.
+        with _io_guard:
+            entry = _find_by_id(device_id, load_json(CACHE_FILE))
+    if not entry:
         raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
-    return Bulb(entry["ip"]), entry
+    return _bulb_obj(entry["ip"]), entry
 
 
 def _supports_moonlight(model: Optional[str]) -> bool:
@@ -352,24 +716,11 @@ def _moonlight_capable(bulb: Bulb, entry: dict) -> bool:
     if model and model != "unknown":
         return False
     try:
-        props = bulb.get_properties(["active_mode"]) or {}
+        with _lock_for(entry.get("ip", "")):
+            props = bulb.get_properties(["active_mode"]) or {}
         return props.get("active_mode") in ("0", "1")
     except Exception:
         return False
-
-
-_bulb_locks: dict[str, threading.Lock] = {}
-_bulb_locks_guard = threading.Lock()
-
-
-def _lock_for(ip: str) -> threading.Lock:
-    """Per-bulb write lock: base, moonlight, and flow share one socket on 55443."""
-    with _bulb_locks_guard:
-        lock = _bulb_locks.get(ip)
-        if lock is None:
-            lock = threading.Lock()
-            _bulb_locks[ip] = lock
-        return lock
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +780,20 @@ def _params(request: Request, payload, fields: list[str]) -> dict:
     return out
 
 
+def _coerce_int(value, field: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field} must be an integer")
+
+
+def _coerce_float(value, field: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field} must be a number")
+
+
 # ---------------------------------------------------------------------------
 # Federation endpoints (matter_webcontrol v0.25 contract)
 # ---------------------------------------------------------------------------
@@ -436,17 +801,21 @@ def _params(request: Request, payload, fields: list[str]) -> dict:
 @app.get("/api/devices")
 def get_devices() -> list[dict]:
     """Federation peers consume this. Returns full device list with states."""
-    return list(_refresh_devices().values())
+    return list(_devices_snapshot().values())
 
 
 @app.get("/api/lights")
 def get_lights() -> dict:
     """Legacy + human-friendly view (kelvin + percent)."""
-    cache = _refresh_devices()
+    cache = _devices_snapshot()
     out = []
     for entry in cache.values():
         states = entry["states"]
         mireds = states.get("color_temp_mireds", 0)
+        raw = states.get("brightness_raw", 0)
+        # raw 1 is the reserved moonlight sentinel — report a non-zero floor so a
+        # moonlit bulb is not shown as 0% while powered on.
+        pct = 1 if raw == 1 else _raw_to_pct(raw)
         out.append({
             "ip": entry["ip"],
             "id": entry["id"],
@@ -454,15 +823,16 @@ def get_lights() -> dict:
             "name": entry["names"][0] if entry["names"] else "Unknown",
             "names": entry["names"],
             "temperature_k": int(1_000_000 / mireds) if mireds else 0,
-            "brightness_pct": _raw_to_pct(states.get("brightness_raw", 0)),
+            "brightness_pct": pct,
             "state": states.get("on_off", False),
+            "reachable": entry.get("reachable", True),
         })
     return {"status": "success", "data": out}
 
 
 @app.get("/api/refresh")
 def refresh() -> dict:
-    count = len(_refresh_devices())
+    count = len(_refresh_devices(force_ssdp=True))
     return {"status": "success", "message": f"Refreshed {count} devices"}
 
 
@@ -470,7 +840,10 @@ def refresh() -> dict:
 def probe_endpoint(subnet: Optional[str] = None):
     """TCP-scan a subnet (default: local /24) for bulbs answering on 55443."""
     subnets = [subnet] if subnet else None
-    added = probe_and_seed(subnets)
+    try:
+        added = probe_and_seed(subnets)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {
         "status": "success",
         "scanned": subnets or _local_ipv4_subnets(),
@@ -480,10 +853,17 @@ def probe_endpoint(subnet: Optional[str] = None):
 
 @app.get("/api/seed")
 def seed_endpoint(ips: str):
-    """Add one or more comma-separated IPs to the cache without SSDP discovery."""
+    """Add one or more comma-separated PRIVATE IPs to the cache (no SSDP)."""
     ip_list = [s.strip() for s in ips.split(",") if s.strip()]
     if not ip_list:
         raise HTTPException(status_code=400, detail="No IPs provided")
+    for tok in ip_list:
+        try:
+            addr = ipaddress.ip_address(tok)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid IP '{tok}'")
+        if not addr.is_private:
+            raise HTTPException(status_code=400, detail=f"Refusing non-private IP '{tok}'")
     added = seed_ips(ip_list)
     return {
         "status": "success",
@@ -501,37 +881,60 @@ def set_device(request: Request, payload: Optional[ControlPayload] = None):
         raise HTTPException(status_code=400, detail="Missing device id")
 
     bulb, entry = _bulb_for(p["id"])
-    brightness = float(p["brightness"]) if p["brightness"] is not None else None
-    temperature = int(p["temperature"]) if p["temperature"] is not None else None
+    brightness = _coerce_float(p["brightness"], "brightness") if p["brightness"] is not None else None
+    temperature = _coerce_int(p["temperature"], "temperature") if p["temperature"] is not None else None
 
+    # Probe-aware capability (handles a seeded ceiling19 still cached as "unknown").
+    # Computed once before the lock; for a known model it short-circuits with no probe.
+    moon_capable = _moonlight_capable(bulb, entry)
+
+    entered_moonlight = False
+    new_states: dict[str, Any] = {}
     try:
-        if brightness is not None:
-            brightness = max(0.0, min(1.0, brightness))
-            if brightness == 0.0:
-                bulb.turn_off()
-            elif brightness < MOONLIGHT_THRESHOLD:
-                # Moonlight where supported, otherwise the lowest normal level.
-                # Gate on the cached model — not a get_prop probe (see
-                # _supports_moonlight). Mode BEFORE brightness so set_brightness's
-                # ensure_on() doesn't re-power in NORMAL and write `bright`.
-                with _lock_for(entry["ip"]):
-                    bulb.turn_on()
-                    if _supports_moonlight(entry.get("model")):
+        with _lock_for(entry["ip"]):
+            if brightness is not None:
+                brightness = max(0.0, min(1.0, brightness))
+                if brightness == 0.0:
+                    bulb.turn_off()
+                    new_states["on_off"] = False
+                    new_states["brightness_raw"] = 0
+                elif brightness < MOONLIGHT_THRESHOLD:
+                    # Moonlight where supported, otherwise the lowest normal level.
+                    # set_power_mode powers the bulb on in MOONLIGHT, so no extra
+                    # turn_on() is needed (it would send a duplicate `set_power on`).
+                    if moon_capable:
                         bulb.set_power_mode(PowerMode.MOONLIGHT)
-                    bulb.set_brightness(max(1, int(brightness * 100)), duration=1000)
-            else:
+                        bulb.set_brightness(max(1, int(brightness * 100)), duration=1000)
+                        entered_moonlight = True
+                        new_states["on_off"] = True
+                        new_states["brightness_raw"] = 1
+                    else:
+                        bulb.turn_on()
+                        bulb.set_brightness(max(1, int(brightness * 100)), duration=1000)
+                        new_states["on_off"] = True
+                        new_states["brightness_raw"] = _pct_to_raw(max(1, int(brightness * 100)))
+                else:
+                    if moon_capable:
+                        bulb.set_power_mode(PowerMode.NORMAL)
+                    else:
+                        bulb.turn_on()
+                    bulb.set_brightness(int(brightness * 100), duration=1000)
+                    new_states["on_off"] = True
+                    new_states["brightness_raw"] = _pct_to_raw(int(brightness * 100))
+
+            # Skip the CT write when this same call just selected moonlight —
+            # set_color_temp would force the bulb off the night-light channel.
+            if temperature is not None and temperature > 0 and not entered_moonlight:
                 bulb.turn_on()
-                if _supports_moonlight(entry.get("model")):
-                    bulb.set_power_mode(PowerMode.NORMAL)
-                bulb.set_brightness(int(brightness * 100), duration=1000)
+                mireds = max(MIRED_MIN, min(MIRED_MAX, _kelvin_to_mireds(temperature)))
+                kelvin = int(1_000_000 / mireds)
+                bulb.set_color_temp(kelvin, duration=1000)
+                new_states["on_off"] = True
+                new_states["color_temp_mireds"] = mireds
 
-        if temperature is not None and temperature > 0:
-            bulb.turn_on()
-            # Clamp via mireds spec range, then convert back.
-            mireds = max(MIRED_MIN, min(MIRED_MAX, _kelvin_to_mireds(temperature)))
-            kelvin = int(1_000_000 / mireds)
-            bulb.set_color_temp(kelvin, duration=1000)
-
+        if entered_moonlight:
+            new_states["color_temp_mireds"] = None  # moonlight clears CT
+        _patch_state(entry["ip"], **new_states)
         return {"status": "success", "id": p["id"]}
     except HTTPException:
         raise
@@ -551,36 +954,49 @@ def level(request: Request, payload: Optional[LevelPayload] = None):
 
     if p["level"] is None:
         try:
-            props = bulb.get_properties(["bright", "power"]) or {}
+            with _lock_for(entry["ip"]):
+                props = bulb.get_properties(["bright", "power", "active_mode"]) or {}
             on = props.get("power") == "on"
+            if on and props.get("active_mode") == "1":
+                # Moonlit: report the reserved sentinel, matching /api/devices.
+                return {"id": p["id"], "level": 1}
             bright_pct = int(props.get("bright") or 0)
             return {"id": p["id"], "level": _pct_to_raw(bright_pct) if on else 0}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    raw = max(0, min(254, int(p["level"])))
+    raw = max(0, min(254, _coerce_int(p["level"], "level")))
+    # Probe-aware: a seeded ceiling19 still cached as model "unknown" must still
+    # reach its night-light channel via raw 1 (the model gate alone would miss it).
+    moon_capable = _moonlight_capable(bulb, entry)
     try:
-        if raw == 0:
-            bulb.turn_off()
-        elif raw == 1 and _supports_moonlight(entry.get("model")):
-            # Reserved sentinel: raw 1 -> the physical night-light (moonlight)
-            # channel. light_programmer encodes a sub-1 schedule level as raw 1 so
-            # moonlight rides the normal level path (no direct /api/moonlight call).
-            # Mode BEFORE brightness; set_brightness then writes nl_br and stays in
-            # moonlight. A non-night-light model never matches here and falls through
-            # to the lowest normal brightness below, the documented fallback.
-            with _lock_for(entry["ip"]):
-                bulb.turn_on()
+        new_states: dict[str, Any] = {}
+        with _lock_for(entry["ip"]):
+            if raw == 0:
+                bulb.turn_off()
+                new_states = {"on_off": False, "brightness_raw": 0}
+            elif raw == 1 and moon_capable:
+                # Reserved sentinel: raw 1 -> the physical night-light (moonlight)
+                # channel. light_programmer encodes a sub-1 schedule level as raw 1 so
+                # moonlight rides the normal level path (no direct /api/moonlight call).
+                # set_power_mode powers the bulb on in MOONLIGHT and writes nl_br.
                 bulb.set_power_mode(PowerMode.MOONLIGHT)
                 bulb.set_brightness(100, duration=1000)
-        else:
-            with _lock_for(entry["ip"]):
-                bulb.turn_on()
-                # Driving the main channel must leave moonlight; the raw path has
-                # no other way to clear mode 5 on a night-light-capable bulb.
-                if _supports_moonlight(entry.get("model")):
+                new_states = {"on_off": True, "brightness_raw": 1, "color_temp_mireds": None}
+            else:
+                # Driving the main channel must leave moonlight; clear mode 5 on a
+                # night-light-capable bulb (probe-aware so an unknown-model ceiling
+                # light is handled too).
+                if moon_capable:
                     bulb.set_power_mode(PowerMode.NORMAL)
-                bulb.set_brightness(max(1, _raw_to_pct(raw)), duration=1000)
+                else:
+                    bulb.turn_on()
+                pct = max(1, _raw_to_pct(raw))
+                bulb.set_brightness(pct, duration=1000)
+                # Record the raw a read-back would yield (never the moonlight
+                # sentinel 1, even for raw==1 on a non-night-light model).
+                new_states = {"on_off": True, "brightness_raw": _pct_to_raw(pct)}
+        _patch_state(entry["ip"], **new_states)
         return {"status": "success", "id": p["id"], "level": raw}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -598,21 +1014,24 @@ def mired(request: Request, payload: Optional[MiredPayload] = None):
     if not p["id"]:
         raise HTTPException(status_code=400, detail="Missing device id")
 
-    bulb, _ = _bulb_for(p["id"])
+    bulb, entry = _bulb_for(p["id"])
 
     if p["mireds"] is None:
         try:
-            props = bulb.get_properties(["ct"]) or {}
+            with _lock_for(entry["ip"]):
+                props = bulb.get_properties(["ct"]) or {}
             kelvin = int(props.get("ct") or 0)
             return {"id": p["id"], "mireds": _kelvin_to_mireds(kelvin)}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    mireds_val = max(MIRED_MIN, min(MIRED_MAX, int(p["mireds"])))
+    mireds_val = max(MIRED_MIN, min(MIRED_MAX, _coerce_int(p["mireds"], "mireds")))
     try:
         kelvin = int(1_000_000 / mireds_val)
-        bulb.turn_on()
-        bulb.set_color_temp(kelvin, duration=1000)
+        with _lock_for(entry["ip"]):
+            bulb.turn_on()
+            bulb.set_color_temp(kelvin, duration=1000)
+        _patch_state(entry["ip"], on_off=True, color_temp_mireds=mireds_val)
         return {"status": "success", "id": p["id"], "mireds": mireds_val}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -648,6 +1067,9 @@ def moonlight(request: Request, payload: Optional[MoonlightPayload] = None):
 
     bulb, entry = _bulb_for(p["id"])
     supported = _moonlight_capable(bulb, entry)
+    nl = None
+    if p["level"] is not None:
+        nl = max(1, min(100, _coerce_int(p["level"], "level")))
     try:
         with _lock_for(entry["ip"]):
             # A running main-channel colour-flow owns the bulb; stop it before
@@ -657,16 +1079,24 @@ def moonlight(request: Request, payload: Optional[MoonlightPayload] = None):
             except Exception:
                 pass
             if not on:
-                bulb.turn_on()
                 bulb.set_power_mode(PowerMode.NORMAL)
+                _patch_state(entry["ip"], on_off=True)
                 return {"status": "success", "id": p["id"], "moonlight": False}
-            nl = 1 if p["level"] is None else max(1, min(100, int(p["level"])))
+            nl = 1 if nl is None else nl
             eff = nl if supported else 1  # no night-light channel -> lowest normal
-            bulb.turn_on()
             if supported:
-                # Mode BEFORE brightness (ensure_on would re-power in NORMAL).
+                # set_power_mode powers on in MOONLIGHT (no separate turn_on()).
                 bulb.set_power_mode(PowerMode.MOONLIGHT)
+            else:
+                bulb.turn_on()
             bulb.set_brightness(eff, duration=1000)
+        patch = {"on_off": True}
+        if supported:
+            patch["brightness_raw"] = 1
+            patch["color_temp_mireds"] = None  # moonlight clears CT
+        else:
+            patch["brightness_raw"] = _pct_to_raw(eff)  # leave CT untouched
+        _patch_state(entry["ip"], **patch)
         return {"status": "success", "id": p["id"],
                 "moonlight": supported, "level": eff}
     except HTTPException:
@@ -739,18 +1169,20 @@ def start_flow(request: Request, payload: Optional[FlowPayload] = None):
         raise HTTPException(status_code=400, detail="Missing device id")
     bulb, entry = _bulb_for(p["id"])
     flow = _build_rain_flow(
-        base=int(p.get("base") or 25),
-        peak=int(p.get("peak") or 100),
-        kelvin=_clampk(int(p.get("kelvin") or 4500)),
+        base=_coerce_int(p.get("base") or 25, "base"),
+        peak=_coerce_int(p.get("peak") or 100, "peak"),
+        kelvin=_clampk(_coerce_int(p.get("kelvin") or 4500, "kelvin")),
         lightning=bool(p.get("lightning")),
-        flash_kelvin=_clampk(int(p.get("flash_kelvin") or 6000)),
+        flash_kelvin=_clampk(_coerce_int(p.get("flash_kelvin") or 6000, "flash_kelvin")),
     )
     try:
         with _lock_for(entry["ip"]):
             bulb.turn_on()
             bulb.start_flow(flow, light_type=LightType.Main)
+        _patch_state(entry["ip"], on_off=True)
         return {"status": "success", "id": p["id"], "flowing": True,
-                "base": int(p.get("base") or 25), "lightning": bool(p.get("lightning"))}
+                "base": _coerce_int(p.get("base") or 25, "base"),
+                "lightning": bool(p.get("lightning"))}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -779,27 +1211,29 @@ def set_name(request: Request, payload: Optional[NamePayload] = None):
     if not device_id or not name:
         raise HTTPException(status_code=400, detail="Missing id or name")
 
-    names = load_names()
-    aliases = names.get(device_id, [])
-    if name not in aliases:
-        aliases.append(name)
-    names[device_id] = aliases
-    save_json(NAMES_FILE, names)
+    with _io_guard:
+        names = load_names()
+        aliases = names.get(device_id, [])
+        if name not in aliases:
+            aliases.append(name)
+        names[device_id] = aliases
+        save_json(NAMES_FILE, names)
     return {"status": "success", "id": device_id, "names": aliases}
 
 
 @app.get("/api/name/remove")
 def remove_name(id: str, name: str):
-    names = load_names()
-    aliases = names.get(id, [])
-    if name not in aliases:
-        raise HTTPException(status_code=404, detail=f"Alias '{name}' not on {id}")
-    aliases.remove(name)
-    if aliases:
-        names[id] = aliases
-    else:
-        names.pop(id, None)
-    save_json(NAMES_FILE, names)
+    with _io_guard:
+        names = load_names()
+        aliases = names.get(id, [])
+        if name not in aliases:
+            raise HTTPException(status_code=404, detail=f"Alias '{name}' not on {id}")
+        aliases.remove(name)
+        if aliases:
+            names[id] = aliases
+        else:
+            names.pop(id, None)
+        save_json(NAMES_FILE, names)
     return {"status": "success", "id": id, "names": aliases}
 
 
@@ -810,25 +1244,11 @@ def metadata(request: Request) -> dict:
     host = request.url.hostname or "127.0.0.1"
     port = request.url.port or DEFAULT_PORT
 
-    cache = load_json(CACHE_FILE) or _refresh_devices()
+    cache = _devices_snapshot()
     devices = []
     for entry in cache.values():
         states = entry.get("states", {})
-        capabilities = []
-        if "on_off" in states:
-            capabilities.append("on_off")
-        if "brightness_raw" in states:
-            capabilities.append("brightness")
-        if "color_temp_mireds" in states:
-            capabilities.append("color_temperature")
-
-        if "color_temp_mireds" in states:
-            hw_type = "color_temperature_light"
-        elif "brightness_raw" in states:
-            hw_type = "dimmable_light"
-        else:
-            hw_type = "on_off_light"
-
+        hw_type, capabilities = _device_class(entry.get("model"), states)
         names = entry.get("names", [])
         devices.append({
             "id": entry["id"],
@@ -897,6 +1317,7 @@ def main():
         )
 
     app.state.api_key = args.api_key
+    _ensure_background_refresh()  # keep the snapshot warm so polls never block
     logging.info(f"Starting service on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
 

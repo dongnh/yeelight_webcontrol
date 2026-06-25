@@ -206,3 +206,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .DS_Store
+
+# Yeelight bridge runtime state (per-host; identity cache + aliases, never committed)
+cache.json
+names.json
+*.corrupt

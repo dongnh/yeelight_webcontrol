@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yeelight-web-controller"
-version = "0.7.0"
+version = "0.8.0"
 description = "Yeelight LAN control bridge — REST API compatible with matter_webcontrol federation."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,6 +25,9 @@ yeelight-srv = "cli.server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "mutating: real-device test that physically changes the bulbs (run with -m mutating)",
+]
 
 [tool.isort]
 profile = "black"

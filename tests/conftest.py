@@ -1,12 +1,19 @@
 """Pytest fixtures for real-device integration tests.
 
-A live Yeelight bulb is required. Configure via environment variables:
+Live Yeelight bulb(s) are required for the real-device suites. Configure via
+environment variables:
 
-    YEELIGHT_TEST_IP   IP of the bulb under test (required)
-    YEELIGHT_TEST_ID   Bulb id (capabilities.id). If unset, discovered.
-    YEELIGHT_TEST_KEY  Optional X-API-Key for the spawned server
+    YEELIGHT_TEST_IPS  Comma-separated bulb IPs (preferred, multi-bulb).
+                       e.g. YEELIGHT_TEST_IPS=192.168.1.7,192.168.1.236
+    YEELIGHT_TEST_IP   Single bulb IP (legacy; used if YEELIGHT_TEST_IPS unset).
+    YEELIGHT_TEST_ID   Bulb id for the single-bulb case. If unset, discovered.
+    YEELIGHT_TEST_KEY  Optional X-API-Key for the spawned server.
 
-Tests are skipped when YEELIGHT_TEST_IP is not set.
+Each bulb's canonical hardware id + model are resolved at session start via the
+bridge's own unicast get_capabilities probe (the same primitive the server uses
+for seeded bulbs), so no broadcast SSDP is needed even for long-running bulbs.
+
+Tests are skipped when neither YEELIGHT_TEST_IPS nor YEELIGHT_TEST_IP is set.
 """
 
 import os
@@ -17,9 +24,18 @@ import time
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
-from yeelight import Bulb, discover_bulbs
+from yeelight import Bulb
 
 from cli import server as srv
+
+
+def _configured_ips() -> list[str]:
+    multi = os.environ.get("YEELIGHT_TEST_IPS", "")
+    ips = [s.strip() for s in multi.split(",") if s.strip()]
+    if ips:
+        return ips
+    single = os.environ.get("YEELIGHT_TEST_IP")
+    return [single] if single else []
 
 
 def _free_port() -> int:
@@ -31,24 +47,38 @@ def _free_port() -> int:
 
 
 @pytest.fixture(scope="session")
-def bulb_ip() -> str:
-    ip = os.environ.get("YEELIGHT_TEST_IP")
-    if not ip:
-        pytest.skip("YEELIGHT_TEST_IP not set — skipping real-device tests")
-    return ip
+def bulb_ips() -> list[str]:
+    ips = _configured_ips()
+    if not ips:
+        pytest.skip("YEELIGHT_TEST_IPS / YEELIGHT_TEST_IP not set — skipping real-device tests")
+    return ips
 
 
 @pytest.fixture(scope="session")
-def bulb_id(bulb_ip) -> str:
-    explicit = os.environ.get("YEELIGHT_TEST_ID")
-    if explicit:
-        return explicit
-    for b in discover_bulbs(timeout=2):
-        if b.get("ip") == bulb_ip:
-            cap_id = (b.get("capabilities") or {}).get("id")
-            if cap_id:
-                return cap_id
-    pytest.skip(f"Could not discover capabilities.id for {bulb_ip}; set YEELIGHT_TEST_ID")
+def bulbs(bulb_ips) -> list[dict]:
+    """Resolve every configured bulb to {ip, id, model, raw}. Skips unreachable ones."""
+    explicit_id = os.environ.get("YEELIGHT_TEST_ID")
+    out = []
+    for i, ip in enumerate(bulb_ips):
+        bid, model = srv._resolve_identity(ip)
+        if not bid and i == 0 and explicit_id:
+            bid, model = explicit_id, "unknown"
+        if not bid:
+            continue
+        out.append({"ip": ip, "id": bid, "model": model or "unknown", "raw": Bulb(ip)})
+    if not out:
+        pytest.skip("No configured bulb answered get_capabilities")
+    return out
+
+
+@pytest.fixture(scope="session")
+def bulb_ip(bulb_ips) -> str:
+    return bulb_ips[0]
+
+
+@pytest.fixture(scope="session")
+def bulb_id(bulbs) -> str:
+    return bulbs[0]["id"]
 
 
 @pytest.fixture(scope="session")
@@ -57,23 +87,28 @@ def raw_bulb(bulb_ip) -> Bulb:
 
 
 @pytest.fixture(scope="session")
-def isolated_workdir(tmp_path_factory, bulb_ip, bulb_id):
-    """Run the server with its own cache/names files in a tmp dir."""
+def isolated_workdir(tmp_path_factory, bulbs):
+    """Run the server with its own cache/names files in a tmp dir, seeded with
+    every configured bulb under its real hardware id + model."""
     work = tmp_path_factory.mktemp("yeelight_srv")
     cwd = os.getcwd()
     os.chdir(work)
-    # Pre-seed cache so endpoints can resolve the bulb without a discover round.
     seed = {
-        bulb_ip: {
-            "id": bulb_id,
+        b["ip"]: {
+            "id": b["id"],
             "endpoint_id": 1,
-            "ip": bulb_ip,
-            "model": "test",
+            "ip": b["ip"],
+            "model": b["model"],
             "names": [],
             "states": {"on_off": False, "brightness_raw": 0},
         }
+        for b in bulbs
     }
     srv.save_json(srv.CACHE_FILE, seed)
+    srv._publish_snapshot(seed)
+    # Don't spawn the perpetual background-refresh daemon during the test session;
+    # tests drive refreshes explicitly. (Mirrors the hardware-free suite.)
+    srv._bg_started = True
     yield work
     os.chdir(cwd)
 
@@ -108,19 +143,19 @@ def live_server(isolated_workdir):
 
 
 @pytest.fixture(autouse=True)
-def restore_bulb():
-    """Leave the bulb on at a sane state after each test (real-device runs only).
+def restore_bulb(request):
+    """Leave every configured bulb on at a sane state after a MUTATING test only.
 
-    Resolves the bulb lazily from the env so hardware-free unit tests aren't
-    skipped by depending on the real-device fixtures.
-    """
+    Read-only tests must never touch the lights, so restoration is gated on the
+    `mutating` marker. Resolved lazily so hardware-free tests aren't skipped by
+    depending on the real-device fixtures."""
     yield
-    ip = os.environ.get("YEELIGHT_TEST_IP")
-    if not ip:
+    if "mutating" not in request.keywords:
         return
-    try:
-        bulb = Bulb(ip)
-        bulb.turn_on()
-        bulb.set_brightness(50, duration=200)
-    except Exception:
-        pass
+    for ip in _configured_ips():
+        try:
+            bulb = Bulb(ip)
+            bulb.turn_on()
+            bulb.set_brightness(50, duration=200)
+        except Exception:
+            pass
