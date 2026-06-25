@@ -562,6 +562,17 @@ def level(request: Request, payload: Optional[LevelPayload] = None):
     try:
         if raw == 0:
             bulb.turn_off()
+        elif raw == 1 and _supports_moonlight(entry.get("model")):
+            # Reserved sentinel: raw 1 -> the physical night-light (moonlight)
+            # channel. light_programmer encodes a sub-1 schedule level as raw 1 so
+            # moonlight rides the normal level path (no direct /api/moonlight call).
+            # Mode BEFORE brightness; set_brightness then writes nl_br and stays in
+            # moonlight. A non-night-light model never matches here and falls through
+            # to the lowest normal brightness below, the documented fallback.
+            with _lock_for(entry["ip"]):
+                bulb.turn_on()
+                bulb.set_power_mode(PowerMode.MOONLIGHT)
+                bulb.set_brightness(100, duration=1000)
         else:
             with _lock_for(entry["ip"]):
                 bulb.turn_on()

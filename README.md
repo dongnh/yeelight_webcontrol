@@ -28,13 +28,13 @@ This is how `light_programmer`'s rain `"effect": "flow"` drives the bulb: the sc
 
 Some Yeelights carry a second, physical light source — a dim warm night-light. Ceiling lights have it, and so do Bedside Lamp 2 and 3. `/api/moonlight` switches a bulb onto it: send `on` with a `level` from 1 to 100 and the bulb drops to its night-light channel at that brightness; send `on: false` and it returns to the normal channel. The server gates on the bulb's model, so a bulb without the channel quietly falls back to the lowest normal brightness rather than failing — the caller always gets a dim light. A running colour-flow is stopped first, so the power-mode switch is never ambiguous.
 
-This is how `light_programmer` renders the bottom of its brightness range: a schedule level between off and the first daylight step routes here instead of to `/api/level`, and an artificial skylight glows like moonlight overnight instead of going dark.
+`/api/level` reaches the same channel through a reserved value: raw `1` enters moonlight (same model gate, same fallback). This is how `light_programmer` renders the bottom of its brightness range — a sub-one schedule level is sent as raw `1` over the normal level path, so an artificial skylight glows like moonlight overnight instead of going dark.
 
 ## API surface
 
 Read: `GET /api/devices`, `GET /api/lights`, `GET /api/metadata`, `GET /api/level`, `GET /api/mired`.
 
-Control: `POST /api/set`, `POST /api/level`, `POST /api/mired`.
+Control: `POST /api/set`, `POST /api/level` (raw `1` enters moonlight on capable models), `POST /api/mired`.
 
 Animation: `POST /api/flow`, `POST /api/flow/stop`.
 
@@ -73,4 +73,4 @@ The suite drives a real bulb and is skipped by default until you provide one ove
 ## Related projects
 
 - [`matter_webcontrol`](https://github.com/dongnh/matter_webcontrol) — the Matter-side server this bridge federates into.
-- [`light_programmer`](https://github.com/dongnh/light_programmer) — schedule engine that uses `/api/flow` for its rain colour-flow and `/api/moonlight` for sub-one schedule levels.
+- [`light_programmer`](https://github.com/dongnh/light_programmer) — schedule engine that drives sub-one schedule levels as the reserved `/api/level` raw `1` (moonlight).
