@@ -25,6 +25,14 @@ The bridge keeps every bulb warm instead of reconnecting per request:
                        answered from memory (~0 ms); a background thread keeps
                        it warm. Broadcast SSDP only runs when a bulb is still
                        unidentified or on a long throttle — never on every poll.
+
+Soft on/off (v0.9.0)
+--------------------
+Every bulb is created with a smooth default transition (`SOFT_MS`, env
+`YEELIGHT_SOFT_MS`, default 800 ms), so turning a light off dims it to 0 and
+then cuts power, and turning it on lifts it back up — a gentle fade rather than
+an instant snap. This is the Bulb-level default, so it applies to every on/off
+path uniformly; brightness/colour-temp writes keep their own per-call durations.
 """
 
 import argparse
@@ -78,6 +86,15 @@ STATE_TTL = float(os.environ.get("YEELIGHT_STATE_TTL", "10"))       # serve memo
 SSDP_THROTTLE = float(os.environ.get("YEELIGHT_SSDP_THROTTLE", "300"))  # min seconds between broadcast SSDP sweeps
 CAPS_TIMEOUT = float(os.environ.get("YEELIGHT_CAPS_TIMEOUT", "2"))  # unicast get_capabilities timeout
 POOL_READ_TIMEOUT = float(os.environ.get("YEELIGHT_POOL_READ_TIMEOUT", "3"))  # warm-socket read timeout
+
+# Soft on/off: duration (ms) of the smooth power transition every bulb fades over.
+# Yeelight firmware, given a `smooth` set_power, dims the main channel to 0 THEN cuts
+# power on OFF, and lifts brightness back up on ON — so switching a light is a gentle
+# animation instead of an instant snap. This becomes the Bulb's DEFAULT transition
+# (see _bulb_obj), so it covers every on/off path (turn_on/turn_off/set_power_mode).
+# A subsequent set_brightness then glides to the exact scheduled level. Set a tiny
+# value (e.g. 50) to effectively disable it; python-yeelight requires >= 30 ms.
+SOFT_MS = max(30, int(float(os.environ.get("YEELIGHT_SOFT_MS", "800"))))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -246,7 +263,12 @@ def _bulb_obj(ip: str) -> Bulb:
     with _bulbs_guard:
         b = _bulbs.get(ip)
         if b is None:
-            b = Bulb(ip, auto_on=False)
+            # effect/duration set here become the DEFAULT transition for every
+            # command that supports one (turn_on / turn_off / set_power_mode), so
+            # power on/off is a smooth SOFT_MS fade rather than an instant snap.
+            # Endpoints that pass their own duration= (colour temp, brightness ramp,
+            # rain colour-flow) still override it per call.
+            b = Bulb(ip, auto_on=False, effect="smooth", duration=SOFT_MS)
             _bulbs[ip] = b
         return b
 
@@ -1318,6 +1340,7 @@ def main():
 
     app.state.api_key = args.api_key
     _ensure_background_refresh()  # keep the snapshot warm so polls never block
+    logging.info("Soft on/off: %d ms smooth power fade (YEELIGHT_SOFT_MS)", SOFT_MS)
     logging.info(f"Starting service on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
 
