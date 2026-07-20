@@ -26,13 +26,16 @@ The bridge keeps every bulb warm instead of reconnecting per request:
                        it warm. Broadcast SSDP only runs when a bulb is still
                        unidentified or on a long throttle — never on every poll.
 
-Soft on/off (v0.9.0)
---------------------
-Every bulb is created with a smooth default transition (`SOFT_MS`, env
-`YEELIGHT_SOFT_MS`, default 800 ms), so turning a light off dims it to 0 and
-then cuts power, and turning it on lifts it back up — a gentle fade rather than
-an instant snap. This is the Bulb-level default, so it applies to every on/off
-path uniformly; brightness/colour-temp writes keep their own per-call durations.
+Soft on/off (v0.9.0; independent on/off durations v0.10.0)
+---------------------------------------------------------
+Every bulb is created with a smooth default transition, so turning a light off
+dims it to 0 and then cuts power, and turning it on lifts it back up — a gentle
+fade rather than an instant snap. The ON and OFF fades are INDEPENDENT
+(`SOFT_ON_MS` / `SOFT_OFF_MS`, env `YEELIGHT_SOFT_ON_MS` / `YEELIGHT_SOFT_OFF_MS`,
+each defaulting to `YEELIGHT_SOFT_MS` = 800 ms), so a light can rise gently (a
+2 s "sunrise") yet still switch off briskly. SOFT_ON_MS is the Bulb-level default
+(covers turn_on / set_power_mode); turn_off passes SOFT_OFF_MS. Brightness and
+colour-temp writes keep their own per-call durations.
 """
 
 import argparse
@@ -87,14 +90,17 @@ SSDP_THROTTLE = float(os.environ.get("YEELIGHT_SSDP_THROTTLE", "300"))  # min se
 CAPS_TIMEOUT = float(os.environ.get("YEELIGHT_CAPS_TIMEOUT", "2"))  # unicast get_capabilities timeout
 POOL_READ_TIMEOUT = float(os.environ.get("YEELIGHT_POOL_READ_TIMEOUT", "3"))  # warm-socket read timeout
 
-# Soft on/off: duration (ms) of the smooth power transition every bulb fades over.
+# Soft on/off: duration (ms) of the smooth power fade a bulb runs when switching.
 # Yeelight firmware, given a `smooth` set_power, dims the main channel to 0 THEN cuts
-# power on OFF, and lifts brightness back up on ON — so switching a light is a gentle
-# animation instead of an instant snap. This becomes the Bulb's DEFAULT transition
-# (see _bulb_obj), so it covers every on/off path (turn_on/turn_off/set_power_mode).
-# A subsequent set_brightness then glides to the exact scheduled level. Set a tiny
-# value (e.g. 50) to effectively disable it; python-yeelight requires >= 30 ms.
-SOFT_MS = max(30, int(float(os.environ.get("YEELIGHT_SOFT_MS", "800"))))
+# power on OFF, and lifts brightness back up on ON — a gentle animation, not a snap.
+# ON and OFF are INDEPENDENT, so a light can rise gently (e.g. a 2 s "mở dần") yet
+# still switch off briskly. SOFT_ON_MS is the Bulb's DEFAULT transition (see
+# _bulb_obj), so it drives every ON path (turn_on / set_power_mode); turn_off passes
+# SOFT_OFF_MS explicitly. YEELIGHT_SOFT_MS sets a shared base for both (back-compat);
+# the direction-specific vars override it. Tiny value (~50) ~= instant; min 30 ms.
+_SOFT_BASE = os.environ.get("YEELIGHT_SOFT_MS", "800")
+SOFT_ON_MS = max(30, int(float(os.environ.get("YEELIGHT_SOFT_ON_MS", _SOFT_BASE))))
+SOFT_OFF_MS = max(30, int(float(os.environ.get("YEELIGHT_SOFT_OFF_MS", _SOFT_BASE))))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -264,11 +270,11 @@ def _bulb_obj(ip: str) -> Bulb:
         b = _bulbs.get(ip)
         if b is None:
             # effect/duration set here become the DEFAULT transition for every
-            # command that supports one (turn_on / turn_off / set_power_mode), so
-            # power on/off is a smooth SOFT_MS fade rather than an instant snap.
-            # Endpoints that pass their own duration= (colour temp, brightness ramp,
-            # rain colour-flow) still override it per call.
-            b = Bulb(ip, auto_on=False, effect="smooth", duration=SOFT_MS)
+            # command that supports one, so an ON (turn_on / set_power_mode) is a
+            # smooth SOFT_ON_MS fade rather than an instant snap. turn_off passes
+            # SOFT_OFF_MS explicitly, and endpoints that pass their own duration=
+            # (colour temp, brightness ramp, rain colour-flow) override it per call.
+            b = Bulb(ip, auto_on=False, effect="smooth", duration=SOFT_ON_MS)
             _bulbs[ip] = b
         return b
 
@@ -917,7 +923,7 @@ def set_device(request: Request, payload: Optional[ControlPayload] = None):
             if brightness is not None:
                 brightness = max(0.0, min(1.0, brightness))
                 if brightness == 0.0:
-                    bulb.turn_off()
+                    bulb.turn_off(duration=SOFT_OFF_MS)
                     new_states["on_off"] = False
                     new_states["brightness_raw"] = 0
                 elif brightness < MOONLIGHT_THRESHOLD:
@@ -995,7 +1001,7 @@ def level(request: Request, payload: Optional[LevelPayload] = None):
         new_states: dict[str, Any] = {}
         with _lock_for(entry["ip"]):
             if raw == 0:
-                bulb.turn_off()
+                bulb.turn_off(duration=SOFT_OFF_MS)
                 new_states = {"on_off": False, "brightness_raw": 0}
             elif raw == 1 and moon_capable:
                 # Reserved sentinel: raw 1 -> the physical night-light (moonlight)
@@ -1340,7 +1346,8 @@ def main():
 
     app.state.api_key = args.api_key
     _ensure_background_refresh()  # keep the snapshot warm so polls never block
-    logging.info("Soft on/off: %d ms smooth power fade (YEELIGHT_SOFT_MS)", SOFT_MS)
+    logging.info("Soft fade: on %d ms / off %d ms (YEELIGHT_SOFT_ON_MS / _OFF_MS)",
+                 SOFT_ON_MS, SOFT_OFF_MS)
     logging.info(f"Starting service on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
 

@@ -36,7 +36,9 @@ Some Yeelights carry a second, physical light source — a dim warm night-light.
 
 ## Soft on/off
 
-Switching a light is a gentle fade, not an instant snap. Every bulb is given a smooth default transition, so turning it off dims the light down to zero and *then* cuts power, and turning it on lifts the brightness back up to the level you asked for. This applies to every on/off path uniformly — a HomeKit tap, a schedule change, or a kill-all all fade the same way. The fade time is `YEELIGHT_SOFT_MS` (milliseconds, default `800`); drop it to something small like `50` to make switching effectively instant again. Brightness and colour-temperature changes keep their own transition timing.
+Switching a light is a gentle fade, not an instant snap. Every bulb is given a smooth default transition, so turning it off dims the light down to zero and *then* cuts power, and turning it on lifts the brightness back up to the level you asked for. This applies to every on/off path uniformly — a HomeKit tap, a schedule change, or a kill-all all fade the same way.
+
+The on and off fades are set independently, so a light can rise gently — a two-second sunrise — yet still switch off briskly. `YEELIGHT_SOFT_ON_MS` sets the turn-on fade and `YEELIGHT_SOFT_OFF_MS` the turn-off fade (milliseconds); each falls back to `YEELIGHT_SOFT_MS` (default `800`) when unset, so one variable still tunes both at once. Drop a value to something small like `50` to make that direction effectively instant. Brightness and colour-temperature changes keep their own transition timing.
 
 ## API surface
 
@@ -58,7 +60,7 @@ Requires Python 3.12 or later, and LAN Control switched on for each bulb in the 
 
 Install from PyPI as `yeelight-web-controller`, or editable from a checkout. Start with `yeelight-srv`, bind to a host and port, and provide an API key when exposing the service on the LAN. `--seed-ip` and `--probe-subnet` reach bulbs when SSDP is silent; `--auto-probe` scans the local /24 on the first request when discovery and cache come back empty.
 
-A seeded bulb is identified up front: at seed time the server asks the bulb for its hardware ID and model directly, so it joins the roster under its permanent hex ID — no waiting for broadcast SSDP. Tuning knobs (env): `YEELIGHT_STATE_TTL` (snapshot freshness, default 10s), `YEELIGHT_SSDP_THROTTLE` (min seconds between broadcast sweeps, default 300s), `YEELIGHT_SOFT_MS` (soft on/off fade, default 800ms).
+A seeded bulb is identified up front: at seed time the server asks the bulb for its hardware ID and model directly, so it joins the roster under its permanent hex ID — no waiting for broadcast SSDP. Tuning knobs (env): `YEELIGHT_STATE_TTL` (snapshot freshness, default 10s), `YEELIGHT_SSDP_THROTTLE` (min seconds between broadcast sweeps, default 300s), `YEELIGHT_SOFT_ON_MS` / `YEELIGHT_SOFT_OFF_MS` (soft turn-on / turn-off fade, each default `YEELIGHT_SOFT_MS` = 800ms).
 
 ## Federation
 
