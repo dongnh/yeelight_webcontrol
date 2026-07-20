@@ -846,11 +846,15 @@ def _bridged_fade(ip: str, direction: str, main_pct: int, kelvin: Optional[int])
             bulb = _bulb_obj(ip)
             k_bright = max(1700, min(6500, int(kelvin or FADE_CT_DEFAULT)))
             if direction == "off":
-                # 1) white gamma+CT ramp main_pct -> 1%, warming toward CT_WARM
+                # 1) white gamma+CT ramp main_pct -> 1%, warming toward CT_WARM.
+                # The bulb paces flow steps a bit slower than requested, so wait
+                # generously (a cut-short stop_flow would strand the ramp mid-way),
+                # then settle the exact 1% floor before handing off.
                 fl, dur = _main_ramp_flow(main_pct, 1, k_bright, FADE_CT_WARM, FADE_MAIN_MS)
-                bulb.start_flow(fl, light_type=LightType.Main); time.sleep(dur / 1000 + 0.05)
+                bulb.start_flow(fl, light_type=LightType.Main); time.sleep(dur / 1000 * 1.6 + 0.25)
                 try: bulb.stop_flow(light_type=LightType.Main)
                 except Exception: pass
+                bulb.set_brightness(1, duration=120)
                 # 2) hand off to the moonlight channel near the crossover brightness
                 _switch_mode(bulb, PowerMode.MOONLIGHT, FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
                 bulb.set_brightness(FADE_MOON_BRIDGE, duration=FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
@@ -867,12 +871,16 @@ def _bridged_fade(ip: str, direction: str, main_pct: int, kelvin: Optional[int])
                 # 3) hand off to the white channel at 1%
                 _switch_mode(bulb, PowerMode.NORMAL, FADE_HANDOFF_MS)
                 bulb.set_brightness(1, duration=FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
-                # 4) white gamma+CT ramp 1% -> main_pct, cooling to k_bright
+                # 4) white gamma+CT ramp 1% -> main_pct, cooling to k_bright. Wait
+                # generously so the flow reaches the top, then settle the EXACT
+                # target brightness + CT (a cut-short flow would otherwise strand
+                # the light at a mid-ramp level).
                 fl, dur = _main_ramp_flow(1, main_pct, FADE_CT_WARM, k_bright, FADE_MAIN_MS)
-                bulb.start_flow(fl, light_type=LightType.Main); time.sleep(dur / 1000 + 0.05)
+                bulb.start_flow(fl, light_type=LightType.Main); time.sleep(dur / 1000 * 1.6 + 0.25)
                 try: bulb.stop_flow(light_type=LightType.Main)
                 except Exception: pass
-                try: bulb.set_color_temp(max(2700, k_bright), duration=200)  # settle exact CT
+                bulb.set_brightness(main_pct, duration=250)
+                try: bulb.set_color_temp(max(2700, k_bright), duration=250)  # settle exact CT
                 except Exception: pass
                 _patch_state(ip, on_off=True, brightness_raw=_pct_to_raw(main_pct),
                              color_temp_mireds=_kelvin_to_mireds(k_bright))
