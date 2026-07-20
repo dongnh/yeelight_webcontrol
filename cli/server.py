@@ -36,6 +36,19 @@ each defaulting to `YEELIGHT_SOFT_MS` = 800 ms), so a light can rise gently (a
 2 s "sunrise") yet still switch off briskly. SOFT_ON_MS is the Bulb-level default
 (covers turn_on / set_power_mode); turn_off passes SOFT_OFF_MS. Brightness and
 colour-temp writes keep their own per-call durations.
+
+Bridged multi-phase fade (v0.11.0)
+----------------------------------
+Opt-in (`YEELIGHT_BRIDGED_FADE=1`), night-light-capable bulbs only. The smoothest
+on/off, closer to a Casambi fixture's eased hardware fade: instead of the
+firmware's LINEAR transition, the bridge drives a perceptual (gamma) brightness
+AND colour-temp ramp on the white channel, then bridges through the moonlight
+(night-light) channel as a sub-1% extension so the descent to black is continuous
+— the white channel's 1% floor no longer cuts hard. OFF ramps the white channel
+down while warming toward `CT_WARM`, hands off to moonlight at its dimmest, then
+cuts power; ON reverses it. Runs in a background thread (the HTTP caller is not
+blocked) and is keyed on the cached on_off so a real on/off fires it once. See the
+FADE_* constants and `_bridged_fade`.
 """
 
 import argparse
@@ -101,6 +114,28 @@ POOL_READ_TIMEOUT = float(os.environ.get("YEELIGHT_POOL_READ_TIMEOUT", "3"))  # 
 _SOFT_BASE = os.environ.get("YEELIGHT_SOFT_MS", "800")
 SOFT_ON_MS = max(30, int(float(os.environ.get("YEELIGHT_SOFT_ON_MS", _SOFT_BASE))))
 SOFT_OFF_MS = max(30, int(float(os.environ.get("YEELIGHT_SOFT_OFF_MS", _SOFT_BASE))))
+
+# Bridged multi-phase fade (v0.11.0): the smoothest on/off, closer to a Casambi
+# fixture's eased hardware fade. Instead of the firmware's LINEAR set_power fade,
+# the bridge drives a perceptual (gamma) brightness + colour-temp ramp on the white
+# channel, then bridges through the moonlight (night-light) channel as a sub-1%
+# extension so the approach to black is continuous — the white channel's 1% floor
+# no longer cuts hard, and the crossover is placed at the dimmest, warmest point
+# where it is least visible. OFF: gamma+CT ramp the white channel down to 1%
+# (warming toward CT_WARM) -> hand to moonlight -> ramp moonlight to its floor ->
+# cut power. ON reverses it. Only bulbs WITH a night-light channel (ceiling lights,
+# bslamp2/3) can bridge; others keep the plain SOFT_* fade. Runs in a background
+# thread so the HTTP caller isn't blocked. One fade per real on/off (minutes apart)
+# stays well under Yeelight's per-minute command quota; music-mode quota bypass is
+# unsupported on ceiling19 anyway, so the fade is deliberately command-frugal.
+BRIDGED_FADE = os.environ.get("YEELIGHT_BRIDGED_FADE", "0") not in ("0", "", "false", "no", "off")
+FADE_GAMMA = max(1.0, float(os.environ.get("YEELIGHT_FADE_GAMMA", "2.2")))
+FADE_MAIN_MS = max(200, int(float(os.environ.get("YEELIGHT_FADE_MAIN_MS", "1400"))))   # white gamma+CT ramp, each way
+FADE_MOON_MS = max(100, int(float(os.environ.get("YEELIGHT_FADE_MOON_MS", "700"))))    # moonlight ramp, each way
+FADE_HANDOFF_MS = max(50, int(float(os.environ.get("YEELIGHT_FADE_HANDOFF_MS", "150"))))  # power-mode switch fade
+FADE_MOON_BRIDGE = max(1, min(100, int(float(os.environ.get("YEELIGHT_FADE_MOON_BRIDGE", "15")))))  # nl_br at the white<->moon handoff
+FADE_CT_WARM = max(1700, min(6500, int(float(os.environ.get("YEELIGHT_FADE_CT_WARM", "2000")))))    # dim-end / crossover colour temp
+FADE_CT_DEFAULT = max(1700, min(6500, int(float(os.environ.get("YEELIGHT_FADE_CT_DEFAULT", "4000")))))  # bright-end CT when unknown
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -752,6 +787,105 @@ def _moonlight_capable(bulb: Bulb, entry: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Bridged multi-phase fade (gamma + colour temp + moonlight bridge)
+# ---------------------------------------------------------------------------
+
+def _cached_states(ip: str) -> dict:
+    """The last-known states for a bulb (on_off / brightness_raw / color_temp_mireds)."""
+    with _state_guard:
+        e = _state_cache.get(ip)
+        return dict(e.get("states", {})) if e else {}
+
+
+def _fade_gamma_pcts(a_pct: int, b_pct: int, n: int) -> list[int]:
+    """`n` brightness-% waypoints from a_pct to b_pct whose PERCEIVED brightness
+    (value ** (1/gamma)) changes linearly, so the ramp dwells in the dim region
+    the eye is most sensitive to instead of rushing through it."""
+    la = (max(1, a_pct) / 100.0) ** (1.0 / FADE_GAMMA)
+    lb = (max(1, b_pct) / 100.0) ** (1.0 / FADE_GAMMA)
+    return [max(1, min(100, round((la + (lb - la) * (i / n)) ** FADE_GAMMA * 100)))
+            for i in range(1, n + 1)]
+
+
+def _fade_steps(ms: int) -> tuple[int, int]:
+    # <= 9 transitions per flow (ceiling19 rejects more), >= 50 ms each.
+    n = max(4, min(9, ms // 120))
+    return n, max(50, ms // n)
+
+
+def _main_ramp_flow(a_pct: int, b_pct: int, k0: int, k1: int, ms: int) -> tuple[Flow, int]:
+    """A white-channel colour-flow that tweens gamma brightness AND colour temp
+    together (each TemperatureTransition sets ct+brightness in one step). In a flow
+    the ct range reaches down to 1700 K; a direct set_color_temp would reject it."""
+    n, st = _fade_steps(ms)
+    tr = []
+    for i, p in enumerate(_fade_gamma_pcts(a_pct, b_pct, n), 1):
+        k = max(1700, min(6500, round(k0 + (k1 - k0) * (i / n))))
+        tr.append(TemperatureTransition(k, duration=st, brightness=p))
+    return Flow(count=1, action=Flow.actions.stay, transitions=tr), n * st
+
+
+def _switch_mode(bulb: Bulb, mode: "PowerMode", ms: int) -> None:
+    """set_power_mode with a QUICK transition. set_power_mode(mode) takes no
+    duration and would inherit the Bulb default (the slow SOFT_ON_MS); the
+    channel handoff must be brief, so override bulb.duration around the call."""
+    d = bulb.duration
+    bulb.duration = ms
+    try:
+        bulb.set_power_mode(mode)
+    finally:
+        bulb.duration = d
+
+
+def _bridged_fade(ip: str, direction: str, main_pct: int, kelvin: Optional[int]) -> None:
+    """Run the eased gamma+CT+moonlight fade for one bulb. Holds the per-IP lock
+    for the whole sequence (called from a daemon thread so the HTTP caller returns
+    immediately). `main_pct` is the bright end (start for OFF, target for ON)."""
+    try:
+        with _lock_for(ip):
+            bulb = _bulb_obj(ip)
+            k_bright = max(1700, min(6500, int(kelvin or FADE_CT_DEFAULT)))
+            if direction == "off":
+                # 1) white gamma+CT ramp main_pct -> 1%, warming toward CT_WARM
+                fl, dur = _main_ramp_flow(main_pct, 1, k_bright, FADE_CT_WARM, FADE_MAIN_MS)
+                bulb.start_flow(fl, light_type=LightType.Main); time.sleep(dur / 1000 + 0.05)
+                try: bulb.stop_flow(light_type=LightType.Main)
+                except Exception: pass
+                # 2) hand off to the moonlight channel near the crossover brightness
+                _switch_mode(bulb, PowerMode.MOONLIGHT, FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
+                bulb.set_brightness(FADE_MOON_BRIDGE, duration=FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
+                # 3) ramp moonlight down to its floor, then 4) cut power
+                bulb.set_brightness(1, duration=FADE_MOON_MS); time.sleep(FADE_MOON_MS / 1000)
+                bulb.turn_off(duration=180)
+                _patch_state(ip, on_off=False, brightness_raw=0)
+            else:  # "on" — reverse of off
+                # 1) power on into moonlight at its floor
+                _switch_mode(bulb, PowerMode.MOONLIGHT, FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
+                bulb.set_brightness(1, duration=FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
+                # 2) ramp moonlight up to the crossover brightness
+                bulb.set_brightness(FADE_MOON_BRIDGE, duration=FADE_MOON_MS); time.sleep(FADE_MOON_MS / 1000)
+                # 3) hand off to the white channel at 1%
+                _switch_mode(bulb, PowerMode.NORMAL, FADE_HANDOFF_MS)
+                bulb.set_brightness(1, duration=FADE_HANDOFF_MS); time.sleep(FADE_HANDOFF_MS / 1000)
+                # 4) white gamma+CT ramp 1% -> main_pct, cooling to k_bright
+                fl, dur = _main_ramp_flow(1, main_pct, FADE_CT_WARM, k_bright, FADE_MAIN_MS)
+                bulb.start_flow(fl, light_type=LightType.Main); time.sleep(dur / 1000 + 0.05)
+                try: bulb.stop_flow(light_type=LightType.Main)
+                except Exception: pass
+                try: bulb.set_color_temp(max(2700, k_bright), duration=200)  # settle exact CT
+                except Exception: pass
+                _patch_state(ip, on_off=True, brightness_raw=_pct_to_raw(main_pct),
+                             color_temp_mireds=_kelvin_to_mireds(k_bright))
+    except Exception as e:
+        logging.warning("bridged fade (%s) failed for %s: %s", direction, ip, e)
+
+
+def _spawn_fade(ip: str, direction: str, main_pct: int = 100, kelvin: Optional[int] = None) -> None:
+    threading.Thread(target=_bridged_fade, args=(ip, direction, main_pct, kelvin),
+                     daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Auth middleware
 # ---------------------------------------------------------------------------
 
@@ -916,6 +1050,31 @@ def set_device(request: Request, payload: Optional[ControlPayload] = None):
     # Computed once before the lock; for a known model it short-circuits with no probe.
     moon_capable = _moonlight_capable(bulb, entry)
 
+    # Bridged multi-phase fade (opt-in, night-light-capable bulbs only): drive the
+    # eased gamma+CT+moonlight fade in the background on a real on/off transition and
+    # return immediately. Keyed on the cached on_off so it fires ONCE; the follow-up
+    # /api/level + /api/mired in the same burst then wait on the per-IP lock and land
+    # the exact brightness/CT after the fade. Moonlight-band brightness is left to the
+    # normal path below (it is itself the night-light channel, nothing to bridge).
+    if BRIDGED_FADE and moon_capable and brightness is not None:
+        st = _cached_states(entry["ip"])
+        is_on = bool(st.get("on_off"))
+        b_clamped = max(0.0, min(1.0, brightness))
+        if b_clamped == 0.0 and is_on:
+            _spawn_fade(entry["ip"], "off", max(1, _raw_to_pct(st.get("brightness_raw", 254))))
+            _patch_state(entry["ip"], on_off=False, brightness_raw=0)
+            return {"status": "success", "id": p["id"]}
+        if b_clamped >= MOONLIGHT_THRESHOLD and not is_on:
+            mireds = st.get("color_temp_mireds")
+            kelvin = temperature or (int(1_000_000 / mireds) if mireds else FADE_CT_DEFAULT)
+            target_pct = max(1, int(b_clamped * 100))
+            _spawn_fade(entry["ip"], "on", target_pct, kelvin)
+            patch = {"on_off": True, "brightness_raw": _pct_to_raw(target_pct)}
+            if temperature:
+                patch["color_temp_mireds"] = _kelvin_to_mireds(temperature)
+            _patch_state(entry["ip"], **patch)
+            return {"status": "success", "id": p["id"]}
+
     entered_moonlight = False
     new_states: dict[str, Any] = {}
     try:
@@ -997,6 +1156,25 @@ def level(request: Request, payload: Optional[LevelPayload] = None):
     # Probe-aware: a seeded ceiling19 still cached as model "unknown" must still
     # reach its night-light channel via raw 1 (the model gate alone would miss it).
     moon_capable = _moonlight_capable(bulb, entry)
+
+    # Bridged multi-phase fade (opt-in). raw == 1 is the reserved moonlight sentinel
+    # (schedule night-light) and is left untouched; only real on/off transitions
+    # (0 <-> >=2) get the eased gamma+CT+moonlight fade, keyed on cached on_off.
+    if BRIDGED_FADE and moon_capable and raw != 1:
+        st = _cached_states(entry["ip"])
+        is_on = bool(st.get("on_off"))
+        if raw == 0 and is_on:
+            _spawn_fade(entry["ip"], "off", max(1, _raw_to_pct(st.get("brightness_raw", 254))))
+            _patch_state(entry["ip"], on_off=False, brightness_raw=0)
+            return {"status": "success", "id": p["id"], "level": raw}
+        if raw >= 2 and not is_on:
+            mireds = st.get("color_temp_mireds")
+            kelvin = int(1_000_000 / mireds) if mireds else FADE_CT_DEFAULT
+            target_pct = max(1, _raw_to_pct(raw))
+            _spawn_fade(entry["ip"], "on", target_pct, kelvin)
+            _patch_state(entry["ip"], on_off=True, brightness_raw=_pct_to_raw(target_pct))
+            return {"status": "success", "id": p["id"], "level": raw}
+
     try:
         new_states: dict[str, Any] = {}
         with _lock_for(entry["ip"]):
@@ -1348,6 +1526,9 @@ def main():
     _ensure_background_refresh()  # keep the snapshot warm so polls never block
     logging.info("Soft fade: on %d ms / off %d ms (YEELIGHT_SOFT_ON_MS / _OFF_MS)",
                  SOFT_ON_MS, SOFT_OFF_MS)
+    if BRIDGED_FADE:
+        logging.info("Bridged fade ON: gamma=%.1f white=%dms moon=%dms bridge_nl=%d ct %d->%dK",
+                     FADE_GAMMA, FADE_MAIN_MS, FADE_MOON_MS, FADE_MOON_BRIDGE, FADE_CT_DEFAULT, FADE_CT_WARM)
     logging.info(f"Starting service on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
 

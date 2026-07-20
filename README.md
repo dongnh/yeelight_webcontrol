@@ -40,6 +40,12 @@ Switching a light is a gentle fade, not an instant snap. Every bulb is given a s
 
 The on and off fades are set independently, so a light can rise gently — a two-second sunrise — yet still switch off briskly. `YEELIGHT_SOFT_ON_MS` sets the turn-on fade and `YEELIGHT_SOFT_OFF_MS` the turn-off fade (milliseconds); each falls back to `YEELIGHT_SOFT_MS` (default `800`) when unset, so one variable still tunes both at once. Drop a value to something small like `50` to make that direction effectively instant. Brightness and colour-temperature changes keep their own transition timing.
 
+### Bridged fade
+
+For bulbs with a night-light channel (ceiling lights, Bedside Lamp 2/3), an opt-in mode gets much closer to a Casambi fixture's eased hardware fade. Set `YEELIGHT_BRIDGED_FADE=1` and, instead of the firmware's linear transition, the bridge drives a perceptual (gamma) brightness *and* colour-temperature ramp on the white channel, then bridges through the moonlight channel as a sub-1% extension so the descent to black stays continuous — the white channel's 1% floor no longer cuts off hard. Turning off, the light dims and warms down the white channel, hands over to the moonlight channel at its dimmest, then powers off; turning on reverses it. The handoff is placed at the dimmest, warmest point where it is least visible. It runs in the background so callers are never blocked, and because a real light only switches on or off every few minutes it stays well under Yeelight's per-minute command quota.
+
+Tuning knobs (env): `YEELIGHT_FADE_GAMMA` (dark-dwell, default `2.2`), `YEELIGHT_FADE_MAIN_MS` (white ramp, `1400`), `YEELIGHT_FADE_MOON_MS` (moonlight ramp, `700`), `YEELIGHT_FADE_MOON_BRIDGE` (night-light level at the crossover, `15`), `YEELIGHT_FADE_CT_WARM` (dim-end colour temp, `2000`), `YEELIGHT_FADE_HANDOFF_MS` (channel-switch fade, `150`).
+
 ## API surface
 
 Read: `GET /api/devices`, `GET /api/lights`, `GET /api/metadata`, `GET /api/level`, `GET /api/mired`.
